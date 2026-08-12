@@ -34,7 +34,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install DotSlash
-        uses: facebook/install-dotslash@v1
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux)  url="https://github.com/facebook/dotslash/releases/download/v0.5.9/dotslash-linux-musl.x86_64.v0.5.9.tar.gz" ;;
+            macOS)  url="https://github.com/facebook/dotslash/releases/download/v0.5.9/dotslash-macos-arm64.v0.5.9.tar.gz" ;;
+            *) echo "unsupported runner os: $RUNNER_OS" >&2; exit 1 ;;
+          esac
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/dotslash.tar.gz" "$url"
+          tar -xzf "$RUNNER_TEMP/dotslash.tar.gz" -C "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/dotslash-bin"
+          mv "$RUNNER_TEMP/dotslash" "$RUNNER_TEMP/dotslash-bin/dotslash"
+          chmod +x "$RUNNER_TEMP/dotslash-bin/dotslash"
+          echo "$RUNNER_TEMP/dotslash-bin" >> "$GITHUB_PATH"
+          dotslash --version
 
       - name: Build release binary
         run: cargo build -p xai-grok-pager-bin --release --target ${{ matrix.target }}
