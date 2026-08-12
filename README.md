@@ -51,6 +51,23 @@ grok --version
 See the [changelog](https://x.ai/build/changelog) for the latest fixes,
 features, and improvements in each release.
 
+### Installing from this repository
+
+Prebuilt binaries built by this repository's CI are published to
+[GitHub Releases](https://github.com/opentokenz/pure-grok/releases) whenever a
+`v*` tag is pushed. Install the latest release with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/opentokenz/pure-grok/main/install.sh | bash            # latest release
+curl -fsSL https://raw.githubusercontent.com/opentokenz/pure-grok/main/install.sh | bash -s v0.1.0  # specific tag
+grok --version
+```
+
+The binary installs to `~/.local/bin/grok` (override with `GROK_BIN_DIR`).
+Available platforms: `linux-x86_64`, `macos-arm64`. Unlike the official script
+above, this installs the binaries built from this repository, not the xAI
+official releases.
+
 ## Building from source
 
 Requirements:
