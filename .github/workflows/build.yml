@@ -47,6 +47,7 @@ jobs:
           mv "$RUNNER_TEMP/dotslash" "$RUNNER_TEMP/dotslash-bin/dotslash"
           chmod +x "$RUNNER_TEMP/dotslash-bin/dotslash"
           echo "$RUNNER_TEMP/dotslash-bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/dotslash-bin:$PATH"
           dotslash --version
 
       - name: Build release binary
