@@ -91,6 +91,12 @@ impl GrokRequestHeaders<'_> {
 /// includes it, and `rs::Tool` deserialization fails. On failure, we strip
 /// unrecognized tools from the raw JSON and retry.
 ///
+/// The same fallback backfills `usage` detail fields that `async_openai`'s
+/// typed `ResponseUsage` declares required but some backends omit
+/// (`output_tokens_details` when the model produced no reasoning tokens,
+/// `input_tokens_details` when nothing was cached), so a missing breakdown
+/// parses as zero instead of failing the whole event.
+///
 /// On `response.completed` / `response.incomplete`, this also rewrites
 /// `response.usage.total_tokens` in place to the live context length
 /// (`context_details.input_tokens + context_details.output_tokens`)
@@ -117,6 +123,9 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
                 {
                     tools.retain(|t| serde_json::from_value::<rs::Tool>(t.clone()).is_ok());
                 }
+                // Backfill usage detail fields some backends omit (see
+                // `fill_default_usage_details`).
+                fill_default_usage_details(&mut value);
                 if let Ok(mut event) = serde_json::from_value::<rs::ResponseStreamEvent>(value) {
                     apply_terminal_event_overrides(&mut event, data);
                     return Ok(event);
@@ -132,6 +141,42 @@ fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
     };
     apply_terminal_event_overrides(&mut event, data);
     Ok(event)
+}
+
+/// Backfill `response.usage` detail fields that `async_openai`'s typed
+/// `ResponseUsage` declares required but some backends omit. A missing
+/// `output_tokens_details` (no reasoning tokens produced) or
+/// `input_tokens_details` (nothing cached) is inserted as a zero-valued
+/// breakdown — the same "absent means zero" semantics as the Messages API
+/// path's `Option`-tolerant reads — so the whole event still parses and
+/// telemetry reports 0. Only the missing keys are touched; complete fields
+/// and an absent `usage` (typed as `Option`) pass through untouched.
+fn fill_default_usage_details(value: &mut serde_json::Value) {
+    let Some(usage) = value
+        .pointer_mut("/response/usage")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+    for (details_key, field, default) in [
+        ("output_tokens_details", "reasoning_tokens", 0u64),
+        ("input_tokens_details", "cached_tokens", 0u64),
+    ] {
+        match usage.get_mut(details_key) {
+            // Whole breakdown missing: insert a zero-valued details object.
+            None => {
+                let mut details = serde_json::Map::new();
+                details.insert(field.to_owned(), serde_json::json!(default));
+                usage.insert(details_key.to_owned(), serde_json::Value::Object(details));
+            }
+            // Breakdown present but the field inside it is missing.
+            Some(serde_json::Value::Object(details)) if !details.contains_key(field) => {
+                details.insert(field.to_owned(), serde_json::json!(default));
+            }
+            // Present and complete, or an unexpected shape — leave as-is.
+            _ => {}
+        }
+    }
 }
 
 /// On terminal Responses API events (`response.completed` /
@@ -2925,6 +2970,128 @@ mod tests {
             panic!("expected ResponseCompleted");
         };
         assert!(e.response.metadata.is_none());
+    }
+
+    /// Regression: some backends omit `output_tokens_details` entirely when
+    /// the model produced no reasoning tokens. The event must parse with
+    /// `reasoning_tokens == 0` instead of failing with
+    /// "missing field `output_tokens_details`".
+    #[test]
+    fn deserialize_response_event_backfills_missing_output_tokens_details() {
+        let sse = r#"{
+            "type": "response.completed",
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "grok-build",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 10,
+                    "input_tokens_details": { "cached_tokens": 0 },
+                    "output_tokens": 5,
+                    "total_tokens": 15
+                }
+            }
+        }"#;
+        let event = deserialize_response_event(sse).expect("parse");
+        let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
+            panic!("expected ResponseCompleted");
+        };
+        let usage = e.response.usage.expect("usage present");
+        assert_eq!(usage.output_tokens_details.reasoning_tokens, 0);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    /// Same backfill for `input_tokens_details.cached_tokens`.
+    #[test]
+    fn deserialize_response_event_backfills_missing_input_tokens_details() {
+        let sse = r#"{
+            "type": "response.completed",
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "grok-build",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "output_tokens_details": { "reasoning_tokens": 0 },
+                    "total_tokens": 15
+                }
+            }
+        }"#;
+        let event = deserialize_response_event(sse).expect("parse");
+        let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
+            panic!("expected ResponseCompleted");
+        };
+        let usage = e.response.usage.expect("usage present");
+        assert_eq!(usage.input_tokens_details.cached_tokens, 0);
+    }
+
+    /// Both breakdowns missing → both backfilled to zero.
+    #[test]
+    fn deserialize_response_event_backfills_all_missing_usage_details() {
+        let sse = r#"{
+            "type": "response.completed",
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "grok-build",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15
+                }
+            }
+        }"#;
+        let event = deserialize_response_event(sse).expect("parse");
+        let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
+            panic!("expected ResponseCompleted");
+        };
+        let usage = e.response.usage.expect("usage present");
+        assert_eq!(usage.output_tokens_details.reasoning_tokens, 0);
+        assert_eq!(usage.input_tokens_details.cached_tokens, 0);
+    }
+
+    /// The details object is present but its inner field is missing — the
+    /// field is backfilled, not the whole breakdown.
+    #[test]
+    fn deserialize_response_event_backfills_missing_reasoning_tokens_inside_details() {
+        let sse = r#"{
+            "type": "response.completed",
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "grok-build",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 10,
+                    "input_tokens_details": { "cached_tokens": 0 },
+                    "output_tokens": 5,
+                    "output_tokens_details": {},
+                    "total_tokens": 15
+                }
+            }
+        }"#;
+        let event = deserialize_response_event(sse).expect("parse");
+        let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
+            panic!("expected ResponseCompleted");
+        };
+        let usage = e.response.usage.expect("usage present");
+        assert_eq!(usage.output_tokens_details.reasoning_tokens, 0);
     }
 
     #[test]
