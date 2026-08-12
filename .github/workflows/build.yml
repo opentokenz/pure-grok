@@ -34,7 +34,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install DotSlash
-        uses: actions/install-dotslash@v1
+        uses: facebook/install-dotslash@v1
 
       - name: Build release binary
         run: cargo build -p xai-grok-pager-bin --release --target ${{ matrix.target }}
