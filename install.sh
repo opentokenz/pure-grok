@@ -22,19 +22,21 @@ RELEASE_BASE="https://github.com/${REPO}/releases/download"
 TARGET="$1"
 
 # --- platform detection (matches the CI build matrix) ---
-os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+uname_s="$(uname -s)"
+os="$(printf '%s' "$uname_s" | tr '[:upper:]' '[:lower:]')"
 arch="$(uname -m)"
-case "$os" in
-    linux)  os="linux" ;;
-    darwin) os="macos" ;;
+case "$uname_s" in
+    Linux)                    os="linux" ;;
+    Darwin)                   os="macos" ;;
+    MINGW*|MSYS*|CYGWIN*)     os="windows" ;;
     *)
-        echo "Unsupported OS: ${os} (prebuilt binaries target Linux and macOS)" >&2
+        echo "Unsupported OS: ${uname_s} (prebuilt binaries target Linux, macOS, and Windows)" >&2
         exit 1
         ;;
 esac
 case "$arch" in
-    x86_64 | amd64)  arch="x86_64" ;;
-    arm64 | aarch64) arch="arm64" ;;
+    x86_64 | amd64 | AMD64)  arch="x86_64" ;;
+    arm64 | aarch64 | ARM64) arch="arm64" ;;
     *)
         echo "Unsupported architecture: ${arch}" >&2
         exit 1
@@ -42,10 +44,15 @@ case "$arch" in
 esac
 
 asset="grok-${os}-${arch}"
+exe=""
+if [ "$os" = "windows" ]; then
+    asset="${asset}.exe"
+    exe=".exe"
+fi
 case "$asset" in
-    grok-linux-x86_64 | grok-macos-arm64) : ;;
+    grok-linux-x86_64 | grok-macos-arm64 | grok-windows-x86_64.exe) : ;;
     *)
-        echo "No prebuilt binary for ${os}-${arch} (available: linux-x86_64, macos-arm64)." >&2
+        echo "No prebuilt binary for ${os}-${arch} (available: linux-x86_64, macos-arm64, windows-x86_64)." >&2
         echo "Build from source instead: cargo build -p xai-grok-pager-bin --release" >&2
         exit 1
         ;;
@@ -135,17 +142,18 @@ if ! "$binary_tmp" --version </dev/null >/dev/null 2>&1; then
 fi
 
 mv -f "$binary_tmp" "$binary_path"
-if [ -f "$BIN_DIR/grok" ]; then
-    mv -f "$BIN_DIR/grok" "$BIN_DIR/grok.old" 2>/dev/null || true
+dest="$BIN_DIR/grok${exe}"
+if [ -f "$dest" ]; then
+    mv -f "$dest" "${dest}.old" 2>/dev/null || true
 fi
-if ! cp -f "$binary_path" "$BIN_DIR/grok"; then
-    mv -f "$BIN_DIR/grok.old" "$BIN_DIR/grok" 2>/dev/null || true
-    echo "Error: failed to install $BIN_DIR/grok" >&2
+if ! cp -f "$binary_path" "$dest"; then
+    mv -f "${dest}.old" "$dest" 2>/dev/null || true
+    echo "Error: failed to install $dest" >&2
     exit 1
 fi
-rm -f "$BIN_DIR/grok.old"
-chmod +x "$BIN_DIR/grok"
-echo "  Installed grok ${version} to ${BIN_DIR}/grok" >&2
+rm -f "${dest}.old"
+chmod +x "$dest"
+echo "  Installed grok ${version} to ${dest}" >&2
 
 case ":$PATH:" in
     *":${BIN_DIR}:"*) : ;;

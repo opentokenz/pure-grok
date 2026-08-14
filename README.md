@@ -60,11 +60,13 @@ Prebuilt binaries built by this repository's CI are published to
 ```sh
 curl -fsSL https://raw.githubusercontent.com/opentokenz/pure-grok/main/install.sh | bash            # latest release
 curl -fsSL https://raw.githubusercontent.com/opentokenz/pure-grok/main/install.sh | bash -s v0.1.0  # specific tag
+irm https://raw.githubusercontent.com/opentokenz/pure-grok/main/install.ps1 | iex                  # Windows PowerShell
 grok --version
 ```
 
-The binary installs to `~/.local/bin/grok` (override with `GROK_BIN_DIR`).
-Available platforms: `linux-x86_64`, `macos-arm64`. Unlike the official script
+The binary installs to `~/.local/bin/grok` (override with `GROK_BIN_DIR`;
+Windows: `%USERPROFILE%\.local\bin\grok.exe`). Available platforms:
+`linux-x86_64`, `macos-arm64`, `windows-x86_64`. Unlike the official script
 above, this installs the binaries built from this repository, not the xAI
 official releases.
 

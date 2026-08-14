@@ -19,9 +19,15 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: grok-linux-x86_64
+            bin: xai-grok-pager
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: grok-macos-arm64
+            bin: xai-grok-pager
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: grok-windows-x86_64.exe
+            bin: xai-grok-pager.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -34,11 +40,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install DotSlash
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Linux)  url="https://github.com/facebook/dotslash/releases/download/v0.5.9/dotslash-linux-musl.x86_64.v0.5.9.tar.gz" ;;
-            macOS)  url="https://github.com/facebook/dotslash/releases/download/v0.5.9/dotslash-macos-arm64.v0.5.9.tar.gz" ;;
+            Linux) url="https://github.com/facebook/dotslash/releases/download/v0.5.9/dotslash-linux-musl.x86_64.v0.5.9.tar.gz" ;;
+            macOS) url="https://github.com/facebook/dotslash/releases/download/v0.5.9/dotslash-macos-arm64.v0.5.9.tar.gz" ;;
             *) echo "unsupported runner os: $RUNNER_OS" >&2; exit 1 ;;
           esac
           curl -fsSL --retry 5 -o "$RUNNER_TEMP/dotslash.tar.gz" "$url"
@@ -50,13 +57,29 @@ jobs:
           export PATH="$RUNNER_TEMP/dotslash-bin:$PATH"
           dotslash --version
 
+      # bin/protoc is a DotSlash wrapper; Windows runners execute it more
+      # reliably via a real protoc.exe + PROTOC (find_protoc checks env first).
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+          $dest = Join-Path $env:RUNNER_TEMP 'protoc'
+          Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $bin = Join-Path $dest 'bin'
+          $exe = Join-Path $bin 'protoc.exe'
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$exe"
+
       - name: Build release binary
         run: cargo build -p xai-grok-pager-bin --release --target ${{ matrix.target }}
 
       - name: Stage artifact
+        shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/xai-grok-pager dist/${{ matrix.artifact }}
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
 
       - uses: actions/upload-artifact@v4
         with:
