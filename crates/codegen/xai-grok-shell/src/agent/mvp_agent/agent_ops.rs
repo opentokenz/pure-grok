@@ -1517,6 +1517,9 @@ impl MvpAgent {
         &self,
         auth: &crate::auth::GrokAuth,
     ) -> crate::remote::SettingsFetch {
+        if !crate::control_plane::enabled() {
+            return crate::remote::SettingsFetch::Fetched(Box::new(Default::default()));
+        }
         let (base_url, alpha) = {
             let cfg = self.cfg.borrow();
             (cfg.endpoints.proxy_url(), cfg.endpoints.alpha_test_key.clone())
@@ -1938,6 +1941,10 @@ impl MvpAgent {
         &self,
         auth: crate::auth::GrokAuth,
     ) -> Option<crate::util::config::RemoteSettings> {
+        if !crate::control_plane::enabled() {
+            tracing::debug!("settings fetch skipped: control plane disabled");
+            return None;
+        }
         if !crate::util::config::resolve_remote_fetch_enabled() {
             tracing::debug!("settings fetch skipped: remote_fetch disabled");
             return None;

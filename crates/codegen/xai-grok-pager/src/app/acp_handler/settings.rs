@@ -56,7 +56,9 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
     // `resolve_dismissable_campaigns`, so a `/model` pick never records its
     // dismissal and the leader re-nudges every new session. Idempotent in
     // embedded mode, where the in-process agent seeds the same cache.
-    if let Some(campaigns) = update.campaigns.clone() {
+    if xai_grok_shell::control_plane::enabled()
+        && let Some(campaigns) = update.campaigns.clone()
+    {
         let rs = xai_grok_shell::util::config::RemoteSettings {
             campaigns,
             ..Default::default()
@@ -126,9 +128,11 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
     // resolution in event_loop — otherwise the proxy's explicit `false`
     // (sent for kill-switch semantics) clobbers a local test override
     // moments after launch.
-    if let Some(v) = update.privacy_notice_rollout {
+    // Kill switch: remote `privacy_notice_rollout: true` must not re-show
+    // the terminal telemetry banner. Env still wins for local e2e.
+    if update.privacy_notice_rollout.is_some() {
         app.privacy_notice_rollout =
-            xai_grok_config::env_bool("GROK_PRIVACY_NOTICE_ROLLOUT").unwrap_or(v);
+            xai_grok_config::env_bool("GROK_PRIVACY_NOTICE_ROLLOUT").unwrap_or(false);
     }
     if let Some(v) = update.privacy_banner_reshow_days {
         app.privacy_banner_reshow_days = Some(
@@ -203,20 +207,22 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
     //   allow_access=Some(false) without a gate_message must NOT clear the
     //   gate (gate_from_settings returns None when gate_message is absent,
     //   which would incorrectly lift an existing gate).
-    if update.allow_access == Some(true) {
-        let effs = app.lift_gate();
-        app.pending_effects.extend(effs);
-    } else if let Some(msg) = update.gate_message.as_ref()
-        && !msg.is_empty()
-    {
-        // (An empty gate_message would only clear the gate message text, NOT
-        // access, so it intentionally does not touch the gate here.)
-        let effs = app.impose_gate(xai_grok_shell::auth::GateInfo {
-            message: msg.clone(),
-            url: update.gate_url.clone(),
-            label: update.gate_label.clone(),
-        });
-        app.pending_effects.extend(effs);
+    if xai_grok_shell::control_plane::enabled() {
+        if update.allow_access == Some(true) {
+            let effs = app.lift_gate();
+            app.pending_effects.extend(effs);
+        } else if let Some(msg) = update.gate_message.as_ref()
+            && !msg.is_empty()
+        {
+            // (An empty gate_message would only clear the gate message text, NOT
+            // access, so it intentionally does not touch the gate here.)
+            let effs = app.impose_gate(xai_grok_shell::auth::GateInfo {
+                message: msg.clone(),
+                url: update.gate_url.clone(),
+                label: update.gate_label.clone(),
+            });
+            app.pending_effects.extend(effs);
+        }
     }
 
     // Load config layers once for tips + group_tool_verbs +
@@ -305,7 +311,9 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
     // response instead (`AgentView::scheduler_background_loops`).
 
     // Re-resolve tips from config layers + the updated remote tips.
-    if let Some(remote_tips) = update.tips {
+    if xai_grok_shell::control_plane::enabled()
+        && let Some(remote_tips) = update.tips
+    {
         use xai_grok_shell::util::config::resolve_tips;
 
         app.tips = resolve_tips(
@@ -413,6 +421,9 @@ pub(super) fn handle_sessions_changed(notif: &acp::ExtNotification, app: &mut Ap
 }
 
 pub(super) fn handle_announcements_update(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
+    if !xai_grok_shell::control_plane::enabled() {
+        return false;
+    }
     let Ok(parsed) =
         serde_json::from_str::<xai_grok_announcements::AnnouncementsRefreshed>(notif.params.get())
     else {

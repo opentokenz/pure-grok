@@ -1009,13 +1009,10 @@ pub(crate) async fn run(
         .and_then(|s| s.show_resolved_model)
         .unwrap_or(true);
     app.sharing_enabled = false;
-    app.privacy_notice_rollout = xai_grok_config::env_bool("GROK_PRIVACY_NOTICE_ROLLOUT")
-        .or_else(|| {
-            remote_settings
-                .as_ref()
-                .and_then(|s| s.privacy_notice_rollout)
-        })
-        .unwrap_or(false);
+    // Client kill switch: never show the terminal privacy/telemetry banner.
+    // Env still wins so e2e can force the surface on; remote settings cannot.
+    app.privacy_notice_rollout =
+        xai_grok_config::env_bool("GROK_PRIVACY_NOTICE_ROLLOUT").unwrap_or(false);
     app.privacy_banner_reshow_days = std::env::var("GROK_PRIVACY_BANNER_RESHOW_DAYS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -1033,7 +1030,11 @@ pub(crate) async fn run(
                 .privacy_banner_acked
         });
     app.plugin_cta_enabled = xai_grok_config::env_bool("GROK_PLUGIN_CTA")
-        .or_else(|| remote_settings.as_ref().and_then(|s| s.plugin_cta))
+        .or_else(|| {
+            xai_grok_shell::control_plane::enabled()
+                .then(|| remote_settings.as_ref().and_then(|s| s.plugin_cta))
+                .flatten()
+        })
         .unwrap_or(false);
     // Voice is applied after auth_meta so API-key detection is accurate.
     app.session_picker_grouped = std::env::var("GROK_SESSION_PICKER_GROUPED")
@@ -1167,8 +1168,10 @@ pub(crate) async fn run(
     app.apply_voice_mode_enabled(voice_mode_enabled);
 
     // Fallback: prefetch may have gate info the shell's AuthMeta missed.
-    // Errs on the side of blocking if stale.
-    if app.gate.is_none()
+    // Errs on the side of blocking if stale. Control-plane off: never
+    // let a remote access gate brick this client.
+    if xai_grok_shell::control_plane::enabled()
+        && app.gate.is_none()
         && let Some(rs) = remote_settings.as_ref()
     {
         app.gate = AppView::gate_from_settings(rs);
@@ -1282,9 +1285,13 @@ pub(crate) async fn run(
                 .and_then(|s| s.scheduler_background_loops),
         );
 
-    app.usage_billing_redirect_url = remote_settings
-        .as_ref()
-        .and_then(|s| s.usage_billing_redirect_url.clone());
+    app.usage_billing_redirect_url = xai_grok_shell::control_plane::enabled()
+        .then(|| {
+            remote_settings
+                .as_ref()
+                .and_then(|s| s.usage_billing_redirect_url.clone())
+        })
+        .flatten();
 
     if app.is_access_blocked() {
         app.welcome_prompt_focused = false;
@@ -1295,9 +1302,13 @@ pub(crate) async fn run(
             resolve_announcements, resolve_slash_command_tags, resolve_tips,
         };
 
-        let remote_announcements = remote_settings
-            .as_ref()
-            .and_then(|s| s.announcements.as_deref());
+        let remote_announcements = xai_grok_shell::control_plane::enabled()
+            .then(|| {
+                remote_settings
+                    .as_ref()
+                    .and_then(|s| s.announcements.as_deref())
+            })
+            .flatten();
         let announcements = resolve_announcements(
             requirements.as_ref(),
             user_config.as_ref(),
@@ -1312,7 +1323,9 @@ pub(crate) async fn run(
         }
         app.sync_session_announcement_slash_gate();
 
-        let remote_tips = remote_settings.as_ref().and_then(|s| s.tips.as_deref());
+        let remote_tips = xai_grok_shell::control_plane::enabled()
+            .then(|| remote_settings.as_ref().and_then(|s| s.tips.as_deref()))
+            .flatten();
         app.tips = resolve_tips(
             requirements.as_ref(),
             user_config.as_ref(),
@@ -1771,11 +1784,13 @@ pub(crate) async fn run(
                 return Ok(finish_run(&mut app));
             }
         }
-        // Fetch changelog off the render path so the welcome screen
-        // can display bullets and /release-notes uses the cached result.
-        let effs = vec![super::actions::Effect::FetchChangelog];
-        if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
-            return Ok(finish_run(&mut app));
+        // Official changelog CDN is marketing/control-plane. Skip unless
+        // the operator re-enabled it.
+        if xai_grok_shell::control_plane::enabled() {
+            let effs = vec![super::actions::Effect::FetchChangelog];
+            if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
+                return Ok(finish_run(&mut app));
+            }
         }
         if !app.has_access() {
             gate_poll_at = Some(Instant::now() + GATE_POLL_INTERVAL);

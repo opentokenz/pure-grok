@@ -408,6 +408,9 @@ pub(super) fn handle_gate_refreshed(
     app: &mut AppView,
     settings: Option<xai_grok_shell::util::config::RemoteSettings>,
 ) -> Vec<Effect> {
+    if !xai_grok_shell::control_plane::enabled() {
+        return vec![];
+    }
     let Some(rs) = settings else {
         return vec![];
     };

@@ -49,7 +49,7 @@ pub(crate) fn prefetch_models_and_settings_blocking(
     let remote_fetch_enabled = crate::util::config::resolve_remote_fetch_enabled();
     let models = prefetch_models_blocking_gated(endpoints, auth, fetch_auth, remote_fetch_enabled);
     let settings = match auth {
-        Some(auth) if remote_fetch_enabled => {
+        Some(auth) if remote_fetch_enabled && crate::control_plane::enabled() => {
             let _timer = crate::instrumentation_timer!("startup.early_settings_fetch");
             crate::remote::fetch_settings_blocking(
                 &endpoints.proxy_url(),

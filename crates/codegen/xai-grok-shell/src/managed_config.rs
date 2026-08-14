@@ -482,6 +482,9 @@ pub fn is_fetch_enabled() -> bool {
     if let Some(v) = crate::agent::config::env_bool("GROK_MANAGED_CONFIG") {
         return v;
     }
+    if !crate::control_plane::enabled() {
+        return false;
+    }
     crate::config::load_effective_config()
         .ok()
         .and_then(|cfg| cfg.get("features")?.get("managed_config")?.as_bool())

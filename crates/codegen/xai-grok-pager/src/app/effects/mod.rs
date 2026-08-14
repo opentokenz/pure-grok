@@ -4244,12 +4244,16 @@ pub(crate) fn execute(
                                     xai_grok_shell::agent::config::CLI_CHAT_PROXY_BASE_URL_DEFAULT
                                         .to_owned()
                                 });
-                            xai_grok_shell::remote::fetch_settings_blocking(
+                            if !xai_grok_shell::control_plane::enabled() {
+                                None
+                            } else {
+                                xai_grok_shell::remote::fetch_settings_blocking(
                                     &proxy_base,
                                     &auth,
                                     None,
                                 )
                                 .into_option()
+                            }
                         })
                         .await
                         .ok()

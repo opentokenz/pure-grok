@@ -3522,10 +3522,26 @@ fn e2e_config_models_parsed_directly_not_via_deep_merge() {
 fn resolve_feedback_defaults_to_true_when_unset() {
     unsafe { std::env::remove_var("GROK_FEEDBACK_ENABLED") };
     unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
+    unsafe { std::env::remove_var(crate::control_plane::ENABLE_ENV) };
     let cfg = Config::default();
     let r = cfg.resolve_feedback();
-    assert!(r.value, "feedback should be true by default");
+    assert!(!r.value, "feedback stays off when the control plane is off");
     assert_eq!(r.source, ConfigSource::Default);
+}
+#[test]
+#[serial]
+fn resolve_feedback_defaults_to_true_when_control_plane_on() {
+    unsafe { std::env::remove_var("GROK_FEEDBACK_ENABLED") };
+    unsafe { std::env::remove_var("GROK_TELEMETRY_ENABLED") };
+    unsafe { std::env::set_var(crate::control_plane::ENABLE_ENV, "1") };
+    let cfg = Config::default();
+    let r = cfg.resolve_feedback();
+    assert!(
+        r.value,
+        "official default is on when control plane is enabled"
+    );
+    assert_eq!(r.source, ConfigSource::Default);
+    unsafe { std::env::remove_var(crate::control_plane::ENABLE_ENV) };
 }
 #[test]
 #[serial]
@@ -3966,6 +3982,7 @@ fn resolve_feedback_config_overrides_remote_settings() {
 #[serial]
 fn resolve_feedback_remote_settings_used_when_no_local() {
     unsafe { std::env::remove_var("GROK_FEEDBACK_ENABLED") };
+    unsafe { std::env::set_var(crate::control_plane::ENABLE_ENV, "1") };
     let cfg = Config {
         remote_settings: Some(crate::util::config::RemoteSettings {
             feedback_enabled: Some(true),
@@ -3976,6 +3993,7 @@ fn resolve_feedback_remote_settings_used_when_no_local() {
     let r = cfg.resolve_feedback();
     assert_eq!(r.source, ConfigSource::Remote);
     assert!(r.value);
+    unsafe { std::env::remove_var(crate::control_plane::ENABLE_ENV) };
 }
 #[test]
 #[serial]

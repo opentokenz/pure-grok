@@ -2426,6 +2426,13 @@ impl Config {
         })
     }
     pub(crate) fn resolve_feedback(&self) -> Resolved<bool> {
+        if !crate::control_plane::enabled() {
+            return BoolFlag::env("GROK_FEEDBACK_ENABLED")
+                .requirement(self.requirements.feedback.pinned())
+                .config(self.features.feedback)
+                .default(false)
+                .resolve();
+        }
         let ff = self
             .remote_settings
             .as_ref()
@@ -2513,10 +2520,13 @@ impl Config {
     /// default off (so only remote settings-targeted teams get it pre-public). No
     /// managed `.requirement` pin: `marketplace_allowlist` already gates sources.
     pub(crate) fn resolve_official_marketplace_auto_register(&self) -> Resolved<bool> {
-        let ff = self
-            .remote_settings
-            .as_ref()
-            .and_then(|s| s.official_marketplace_auto_register);
+        let ff = crate::control_plane::enabled()
+            .then(|| {
+                self.remote_settings
+                    .as_ref()
+                    .and_then(|s| s.official_marketplace_auto_register)
+            })
+            .flatten();
         BoolFlag::env("GROK_OFFICIAL_MARKETPLACE_AUTO_REGISTER")
             .feature_flag(ff)
             .default(false)

@@ -1,6 +1,10 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
     use super::*;
 
+    fn enable_control_plane() -> crate::test_util::EnvVarGuard {
+        crate::test_util::EnvVarGuard::set(xai_grok_shell::control_plane::ENABLE_ENV, "1")
+    }
+
     /// Stale or duplicate gens short-circuit BEFORE the seam (and its config
     /// disk loads) runs — nothing observable may change.
     #[test]
@@ -40,6 +44,7 @@
     /// gen sequence applies, and a duplicate broadcast seed copy stays a no-op.
     #[test]
     fn announcements_update_applies_after_reconnect_watermark_reset() {
+        let _cp = enable_control_plane();
         let mut app = make_app_with_agent("sess-ann");
         // Watermark from the previous connection, ahead of the new shell's gens.
         app.announcements_last_gen = 9_999_999_999;

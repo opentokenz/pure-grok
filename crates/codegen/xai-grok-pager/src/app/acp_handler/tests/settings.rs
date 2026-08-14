@@ -582,6 +582,57 @@
         assert!(!app.show_resolved_model, "other settings fields still apply");
     }
 
+    /// Control plane off: a remote access gate must not brick the TUI.
+    #[test]
+    fn settings_update_gate_ignored_when_control_plane_off() {
+        let mut app = make_app_with_agent("sess-gate-kill");
+        assert!(app.gate.is_none());
+
+        let notif = acp::ExtNotification::new(
+            "x.ai/settings/update",
+            serde_json::value::to_raw_value(&serde_json::json!({
+                "gate_message": "Subscribe to continue",
+                "gate_url": "https://x.ai/cli",
+                "gate_label": "Upgrade",
+            }))
+            .unwrap()
+            .into(),
+        );
+        let _ = handle_ext_notification(&notif, &mut app);
+
+        assert!(
+            app.gate.is_none(),
+            "remote access gate must stay off when control plane is disabled"
+        );
+    }
+
+    /// Temporary client kill switch: remote `privacy_notice_rollout: true`
+    /// must not re-show the terminal telemetry / coding-data banner.
+    #[test]
+    fn settings_update_privacy_notice_rollout_true_stays_forced_off() {
+        let mut app = make_app_with_agent("sess-privacy-banner-kill");
+        app.privacy_notice_rollout = true;
+
+        let notif = acp::ExtNotification::new(
+            "x.ai/settings/update",
+            serde_json::value::to_raw_value(&serde_json::json!({
+                "privacy_notice_rollout": true,
+            }))
+            .unwrap()
+            .into(),
+        );
+        let _ = handle_ext_notification(&notif, &mut app);
+
+        assert!(
+            !app.privacy_notice_rollout,
+            "remote true must not lift the privacy-banner kill switch"
+        );
+        assert!(
+            !app.privacy_banner_should_show(),
+            "kill switch must keep the terminal telemetry banner hidden"
+        );
+    }
+
     /// Temporary client kill switch: remote `sharing_enabled: true` must not
     /// re-enable share UI. Agents stay off and `/share` stays menu-hidden
     /// (typed `/share` still dispatches for the disable message).
