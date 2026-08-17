@@ -531,7 +531,6 @@ struct LocalTerminalActor {
     /// Whether persistent shell state is enabled.
     persistent_shell: bool,
 
-    #[cfg(unix)]
     login_shell_capture: bool,
 
     /// Per-backend `find`→`bfs` / `grep`→`ugrep` shadow enable state, resolved
@@ -573,8 +572,6 @@ impl LocalTerminalActor {
         session_scope: Option<crate::util::ProcessScope>,
         shell_env_policy: Option<crate::util::ShellEnvironmentPolicy>,
     ) -> Self {
-        #[cfg(not(unix))]
-        let _ = login_shell_capture;
         Self {
             cmd_rx,
             cancel_token,
@@ -590,7 +587,6 @@ impl LocalTerminalActor {
             _cgroup_guard: cgroup_guard,
             memory_monitor,
             persistent_shell,
-            #[cfg(unix)]
             login_shell_capture,
             search_shadows,
             #[cfg(unix)]
@@ -3237,7 +3233,7 @@ fn spawn_shell_command(
     };
 
     #[cfg(not(unix))]
-    let build_cmd = |with_breakaway: bool| {
+    let mut build_cmd = |with_breakaway: bool| {
         use windows::Win32::System::Threading::{
             CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
         };

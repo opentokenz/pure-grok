@@ -36,6 +36,10 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.target }}
+          # Default is `-D warnings`, which overrides `.cargo/config.toml`
+          # rustflags (including Windows `crt-static`). Match upstream: keep
+          # target rustflags, treat rustc warnings as warnings.
+          rustflags: ""
 
       - uses: Swatinem/rust-cache@v2
 

@@ -34,8 +34,6 @@ pub(crate) enum LiveCwdScan {
     // Never constructed on the scanning platforms, but a distinct state from Failed.
     #[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
     Unsupported,
-    // Only the linux/macos scanners construct Failed; other targets return Unsupported.
-    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Failed,
 }
 
@@ -47,7 +45,6 @@ pub(crate) fn usable_cwds(scan: &LiveCwdScan, force: bool) -> Option<&[PathBuf]>
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn scan_contains_cwd(cwds: &[PathBuf], path: &Path) -> bool {
     let path_canon = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     cwds.iter().any(|c| {
@@ -57,7 +54,6 @@ fn scan_contains_cwd(cwds: &[PathBuf], path: &Path) -> bool {
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn validate_cwd_scan(cwds: Vec<PathBuf>) -> LiveCwdScan {
     match std::env::current_dir() {
         Ok(cwd) if scan_contains_cwd(&cwds, &cwd) => LiveCwdScan::Ok(cwds),
