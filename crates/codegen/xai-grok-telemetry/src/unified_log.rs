@@ -217,15 +217,21 @@ fn test_log_dir() -> &'static PathBuf {
             "grok-unified-log-test-{}-{nanos}",
             std::process::id()
         ));
-        let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = fs::DirBuilder::new();
             builder.mode(0o700);
+            builder
+                .create(&dir)
+                .expect("create private unified-log test dir");
         }
-        builder
-            .create(&dir)
-            .expect("create private unified-log test dir");
+        #[cfg(not(unix))]
+        {
+            fs::DirBuilder::new()
+                .create(&dir)
+                .expect("create private unified-log test dir");
+        }
         dir
     })
 }
