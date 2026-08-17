@@ -6,6 +6,38 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{fs, iter};
 
+/// Device protoc can write a dummy descriptor set to. `/dev/null` does not
+/// exist on Windows; `NUL` is the equivalent sink.
+fn descriptor_sink() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
+/// Remainder of the first makefile line after `target:`.
+///
+/// protoc `--dependency_out` is makefile syntax: `outfile: dep1 dep2 \`.
+/// Windows may emit `NUL` as `nul`.
+fn makefile_remainder_after_target<'a>(output: &'a str, target: &str) -> anyhow::Result<&'a str> {
+    let first_line = output
+        .lines()
+        .next()
+        .context("protoc command output is empty")?;
+    let prefix = format!("{target}:");
+    if let Some(rem) = first_line.strip_prefix(prefix.as_str()) {
+        return Ok(rem);
+    }
+    if first_line.len() >= prefix.len() && first_line[..prefix.len()].eq_ignore_ascii_case(&prefix)
+    {
+        return Ok(&first_line[prefix.len()..]);
+    }
+    Err(anyhow::anyhow!(
+        "protoc command output must start with {target}: {output:?}"
+    ))
+}
+
+fn is_well_known_include(line: &str) -> bool {
+    line.contains("/include/google/protobuf/") || line.contains("\\include\\google\\protobuf\\")
+}
+
 /// Find the protoc well-known types include directory.
 ///
 /// When PROTOC is set (e.g., in Bazel), the include directory is typically
@@ -126,11 +158,16 @@ impl XaiProtoBuilder {
         }
 
         // Can only process one input file when using --dependency_out=FILE.
+        // `/dev/stdout` and `/dev/null` do not exist on Windows, so the dep
+        // list goes to a tempfile and the dummy descriptor set to the platform
+        // null device.
+        let desc_sink = descriptor_sink();
         for proto in protos {
+            let dep_file = tempfile::NamedTempFile::new().context("protoc dep tempfile")?;
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
             command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+                .arg(format!("--dependency_out={}", dep_file.path().display()))
+                .arg(format!("--descriptor_set_out={desc_sink}"));
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -151,27 +188,20 @@ impl XaiProtoBuilder {
             command.stdin(Stdio::null());
             command.stderr(Stdio::inherit());
 
-            let output = command.output().context("protoc command failed")?;
-            if !output.status.success() {
+            let status = command.output().context("protoc command failed")?.status;
+            if !status.success() {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output =
-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
-
-            let mut lines = output.lines();
-            let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
-            })?;
-            for line in iter::once(rem).chain(lines) {
+            let output = fs::read_to_string(dep_file.path()).context("read protoc dep file")?;
+            let rem = makefile_remainder_after_target(&output, desc_sink)?;
+            for line in iter::once(rem).chain(output.lines().skip(1)) {
                 let line = line.trim();
                 let line = line.strip_suffix("\\").unwrap_or(line);
                 // Depending on absolute paths like
                 // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
                 // is valid, but we want to have output more deterministic.
-                if line.contains("/include/google/protobuf/") {
+                if is_well_known_include(line) {
                     continue;
                 }
 
@@ -324,5 +354,39 @@ pub fn configure() -> XaiProtoBuilder {
         pbjson_preserve_proto_field_names: false,
         file_descriptor_set_path: None,
         honor_debug_redact: false,
+    }
+}
+
+#[cfg(test)]
+mod makefile_dep_tests {
+    use super::{is_well_known_include, makefile_remainder_after_target};
+
+    #[test]
+    fn strips_unix_null_prefix() {
+        let rem =
+            makefile_remainder_after_target("/dev/null: proto/foo.proto\n", "/dev/null").unwrap();
+        assert_eq!(rem.trim(), "proto/foo.proto");
+    }
+
+    #[test]
+    fn strips_windows_nul_case_insensitively() {
+        let rem = makefile_remainder_after_target("nul: proto\\foo.proto\n", "NUL").unwrap();
+        assert_eq!(rem.trim(), "proto\\foo.proto");
+    }
+
+    #[test]
+    fn rejects_mismatched_target() {
+        assert!(makefile_remainder_after_target("other: a.proto\n", "/dev/null").is_err());
+    }
+
+    #[test]
+    fn detects_well_known_includes_on_both_separators() {
+        assert!(is_well_known_include(
+            "/opt/homebrew/include/google/protobuf/timestamp.proto"
+        ));
+        assert!(is_well_known_include(
+            r"C:\protoc\include\google\protobuf\timestamp.proto"
+        ));
+        assert!(!is_well_known_include("proto/grok-tools.proto"));
     }
 }
