@@ -21,7 +21,7 @@ grok models
 ### CLI Flag
 
 ```bash
-grok -p "Hello" -m grok-build
+grok -p "Hello" -m grok-4.6
 ```
 
 ### Slash Command
@@ -29,18 +29,30 @@ grok -p "Hello" -m grok-build
 In the TUI, switch models during a session:
 
 ```
-/model grok-build
+/model grok-4.6
 ```
 
 Or use the alias:
 
 ```
-/m grok-build
+/m grok-4.6
 ```
 
 ### Model Picker (Ctrl+M)
 
 Press `Ctrl+M` from the scrollback pane to open the model picker. It lists all available models, both built-in and custom, and lets you switch with a single keystroke. With the prompt focused, `Ctrl+M` toggles multiline input instead -- use `/model` to switch without leaving the prompt.
+
+### Fleet allowlist (`requirements.toml`)
+
+Enterprise hosts can pin the **selectable** set — not only the default — in signed `requirements.toml`. That list **replaces** any user `allowed_models` (it is not a union), so `/model`, `Ctrl+M`, and `-m` cannot offer models outside it.
+
+```toml
+[models]
+default = "grok-4.5"
+allowed_models = ["grok-4.5", "grok-4*"]
+```
+
+A fleet pin matches the **model id** (not a user-chosen catalog key), so a local `[model.<name>]` entry cannot widen the set. User-config `allowed_models` still matches catalog key or model id. Omit the key to leave user config standing. An empty array is unrestricted. A present-but-unreadable pin fail-closes (nothing selectable). A default or `-m` value outside the pinned set is rejected once the model catalog is fetched — contact your administrator; the list is not user-editable.
 
 ### Config Default
 
@@ -126,6 +138,7 @@ top_p                       = 0.95
 max_completion_tokens       = 8192
 max_retries                 = 8
 inference_idle_timeout_secs = 600
+subagent_rate_limit_max_attempts = 8
 stream_tool_calls           = true
 ```
 
@@ -171,11 +184,11 @@ You can override specific fields of built-in models without redefining everythin
 
 ```toml
 # Override only the API key for a default model
-[model.grok-build]
+[model.grok-4.6]
 api_key = "my-api-key"
 
 # Override temperature and add a custom API key
-[model.grok-build]
+[model.grok-4.6]
 temperature = 0.5
 api_key = "sk-custom"
 ```
@@ -297,7 +310,7 @@ grok
 models_base_url = "https://api.acme.com/v1"
 
 # Override only the API key for a specific model
-[model.grok-build]
+[model.grok-4.6]
 api_key = "my-api-key"
 ```
 
@@ -373,9 +386,9 @@ auth_token_ttl = 3600
 default = "company-grok"
 
 [model.company-grok]
-model = "grok-build"
+model = "grok-4.6"
 base_url = "https://grok-proxy.acme.com/"
-name = "Grok Build Latest (Proxy)"
+name = "Grok 4.6 (Proxy)"
 context_window = 128000
 
 [features]

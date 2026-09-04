@@ -38,8 +38,8 @@ impl ModelRequestHistory {
         self.0
     }
 }
-/// Drops tool results and flattens assistant `tool_calls` into
-/// `[Called tools: ...]` text annotations.
+/// Drops tool results and backend tool calls, and flattens assistant
+/// `tool_calls` into `[Called tools: ...]` text annotations.
 ///
 /// Mutates assistant text in place; do NOT use this directly when sending
 /// to a provider that validates signed `reasoning` blocks against the
@@ -52,6 +52,7 @@ pub(crate) fn strip_tool_messages_for_conversation_item(
         .into_iter()
         .filter_map(|item| match item {
             ConversationItem::ToolResult(_) => None,
+            ConversationItem::BackendToolCall(_) => None,
             ConversationItem::Assistant(mut a) => {
                 if !a.tool_calls.is_empty() {
                     let tool_names: Vec<String> =
@@ -599,6 +600,29 @@ pub struct BackgroundTaskSummary {
     /// `None` omits it from the reminder.
     pub tool_name: Option<String>,
 }
+/// Summary of a still-registered scheduled loop for compaction context.
+#[derive(Clone)]
+pub struct ScheduledLoopSummary {
+    pub task_id: String,
+    pub interval: String,
+    pub next_fire_at: String,
+    pub prompt: String,
+    pub recurring: bool,
+    pub durable: bool,
+    pub foreground: bool,
+}
+/// Summary of a still-live workflow run for compaction context.
+#[derive(Clone)]
+pub struct WorkflowRunSummary {
+    pub name: String,
+    pub run_id: String,
+    pub status: String,
+    pub objective: String,
+    pub current_phase: Option<String>,
+    pub agents_used: u64,
+    pub agent_budget: Option<u64>,
+    pub elapsed_ms: u64,
+}
 /// Summary of a connected MCP server for compaction context.
 #[derive(Clone)]
 pub struct CompactionServerSummary {
@@ -666,6 +690,12 @@ pub struct CompactionStateContext {
     /// Todo list captured at compaction time, for post-compaction
     /// system-reminder injection.
     pub todos: Vec<TodoSummary>,
+    /// Scheduled loops still registered at compaction time.
+    pub scheduled_loops: Vec<ScheduledLoopSummary>,
+    /// Non-terminal workflow runs at compaction time.
+    pub workflows: Vec<WorkflowRunSummary>,
+    /// Model-facing workflow tool name, when one could be resolved.
+    pub workflow_tool_name: Option<String>,
 }
 /// Live session state captured at compaction time, fed to
 /// [`CompactionStateContext::build`].
@@ -678,6 +708,9 @@ pub struct CompactionInputs {
     pub agent_edited_paths: BTreeSet<String>,
     pub connected_mcp_servers: Vec<CompactionServerSummary>,
     pub todos: Vec<TodoSummary>,
+    pub scheduled_loops: Vec<ScheduledLoopSummary>,
+    pub workflows: Vec<WorkflowRunSummary>,
+    pub workflow_tool_name: Option<String>,
 }
 impl CompactionStateContext {
     /// Build the state context from current session state.
@@ -696,6 +729,9 @@ impl CompactionStateContext {
             running_subagents: inputs.running_subagents,
             connected_mcp_servers: inputs.connected_mcp_servers,
             todos: inputs.todos,
+            scheduled_loops: inputs.scheduled_loops,
+            workflows: inputs.workflows,
+            workflow_tool_name: inputs.workflow_tool_name,
         }
     }
     /// Create a task summary from individual fields.
@@ -734,6 +770,9 @@ impl CompactionStateContext {
             running_subagents: self.running_subagents.clone(),
             connected_mcp_servers: self.connected_mcp_servers.clone(),
             todos: self.todos.clone(),
+            scheduled_loops: self.scheduled_loops.clone(),
+            workflows: self.workflows.clone(),
+            workflow_tool_name: self.workflow_tool_name.clone(),
         }
     }
 }

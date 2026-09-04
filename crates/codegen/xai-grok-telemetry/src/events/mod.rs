@@ -1,19 +1,16 @@
 //! Telemetry event structs. Every struct needs a `telemetry_event!` binding.
-//! `session_id` and `turn_number` are auto-injected by `log_event` (which
-//! lives in shell's integration layer).
+//! `log_event` auto-injects `session_id`/`turn_number` and reserves every key in `client::RESERVED_EVENT_KEYS`.
 //!
-//! These structs were extracted from `xai-grok-shell` so they can be
-//! reused across binaries (TUI, sampler) without dragging the shell HTTP /
-//! product-analytics client along. The `CompactionScope` helper that drives paired
-//! `compaction_triggered`/`compaction_completed` emission stays in shell --
-//! it calls `super::log_event` directly.
+//! Extracted from `xai-grok-shell` so binaries (TUI, sampler) can reuse them without the shell's HTTP product-analytics client.
 
 use serde::Serialize;
 
 use super::enums::PermissionMode;
 pub use super::enums::PrCreationSource;
 
+mod active_agent_message;
 mod permission_analytics;
+pub use active_agent_message::*;
 pub use permission_analytics::*;
 
 /// Binds a product event name to a struct. Implement via `telemetry_event!` below.
@@ -21,9 +18,9 @@ pub trait TelemetryEvent: Serialize + Send + 'static {
     const NAME: &'static str;
 
     /// Curated external-OTEL representation (see [`crate::external`]).
-    /// Default: not exported externally. Override via the macro's
-    /// `external = …` arm — the mapping functions live together in
-    /// `external/schema.rs` so the whole wire schema is one reviewable file.
+    /// Default: not exported externally.
+    /// Override via the macro's `external = …` arm.
+    /// The mapping functions live together in `external/schema.rs` so the whole wire schema is one reviewable file.
     fn external_record(&self) -> Option<crate::external::schema::ExternalRecord> {
         None
     }
@@ -65,9 +62,11 @@ pub enum ContextualTipKind {
     ImageInput,
     SendNow,
     SmallScreen,
-    /// Double-click fold/nav path → tip to enable Word select in settings.
+    /// A double-click on the fold/nav path shows a tip to enable Word select in settings.
     WordSelect,
-    /// SSH session without `grok wrap` → tip to wrap the ssh command locally.
+    /// Three nearby drag-copies → tip naming /copy and /export.
+    ExportCopy,
+    /// An SSH session without `grok wrap` shows a tip to wrap the ssh command locally.
     SshWrap,
 }
 
@@ -87,6 +86,11 @@ pub enum PromptSuggestionAction {
     Accepted,
     /// The user explicitly dismissed the ghost text (Esc).
     Dismissed,
+    SkippedCatalog,
+    Fetched,
+    FetchedEmpty,
+    Filtered,
+    FetchFailed,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -99,6 +103,7 @@ pub enum YoloTrigger {
 
 #[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AccessKind {
     Read,
     Edit,
@@ -106,6 +111,8 @@ pub enum AccessKind {
     Grep,
     Mcp,
     Web,
+    AgentMessage,
+    Other,
 }
 
 /// Outcome of one CLI binary install/update attempt.
@@ -116,8 +123,7 @@ pub enum CliUpdateOutcome {
     Failed,
 }
 
-/// Why a CLI binary install/update failed. Smoke kinds are post-download
-/// `--version` checks; other kinds cover download/activation/misc errors.
+/// Smoke kinds are post-download `--version` checks; other kinds cover download/activation/misc errors.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CliUpdateErrorKind {
@@ -129,8 +135,7 @@ pub enum CliUpdateErrorKind {
     Other,
 }
 
-/// Installer that performed the attempt. Wire values match the persisted
-/// installer strings; `Other` bounds unknown persisted values.
+/// Wire values match the persisted installer strings; `Other` covers unknown persisted values.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CliUpdateInstaller {
     #[serde(rename = "npm")]
@@ -155,13 +160,11 @@ impl CliUpdateInstaller {
     }
 }
 
-/// What kicked off the install/update. Travels across the process boundary
-/// as `--trigger=<value>`; [`CliUpdateTrigger::as_str`] and `FromStr` are
-/// the one rendering (round-trip pinned with the wire values in tests).
+/// The trigger crosses the process boundary as `--trigger=<value>`.
+/// [`CliUpdateTrigger::as_str`] and `FromStr` are the only rendering; tests pin the round trip with the wire values.
 ///
-/// Volume caveat: one-shot `grok update` resolves telemetry from disk+env
-/// only, so `user_command` under-reports relative to the in-process
-/// `leader_converge` — the triggers are not directly comparable.
+/// Volume caveat: one-shot `grok update` resolves telemetry from disk and env only.
+/// So `user_command` under-reports relative to the in-process `leader_converge`; the triggers are not directly comparable.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CliUpdateTrigger {
@@ -224,6 +227,26 @@ pub enum CompactionTrigger {
     Auto,
 }
 
+/// Mixpanel mode label. Detail is omitted so `segments` never includes it.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionModeLabel {
+    Summary,
+    Transcript,
+    Segments,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TwoPassOutcome {
+    /// Policy or product-exception off (cursor, subagents).
+    Disabled,
+    /// Enabled, fell back to single-pass.
+    SinglePass,
+    /// Pass-2 summary applied.
+    TwoPass,
+}
+
 #[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
@@ -240,8 +263,8 @@ pub enum HookOutcome {
     Blocked,
 }
 
-/// Outcome of one `PreToolUse` gate callback. Only `Denied` blocks the tool; the rest
-/// (including the `TimedOut`/`TransportError`/`Malformed`/`UnknownDecision` fail-open paths) let it run.
+/// Outcome of one `PreToolUse` gate callback.
+/// Only `Denied` blocks the tool; the rest (including the `TimedOut`/`TransportError`/`Malformed`/`UnknownDecision` fail-open paths) let it run.
 #[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientHookGateOutcome {
@@ -362,24 +385,24 @@ pub struct Login {
     pub user_id: Option<String>,
 }
 
-/// The login-method picker was shown. `trigger` is "startup", "logout", or
-/// "mid_session".
+/// The login-method picker was shown.
+/// `trigger` is "startup", "logout", or "mid_session".
 #[derive(Serialize)]
 pub struct LoginPickerShown {
     pub trigger: String,
 }
 
-/// A login method was chosen from the picker. `method` is "xai" or "api_key";
-/// `mode` is "device", "loopback", or "api_key".
+/// A login method was chosen from the picker.
+/// `method` is "xai" or "api_key"; `mode` is "device", "loopback", or "api_key".
 #[derive(Serialize)]
 pub struct LoginMethodChosen {
     pub method: String,
     pub mode: String,
 }
 
-/// A login flow completed successfully. `method` is "xai" or "api_key";
-/// `mode` is the resolved auth mode; `mid_session` is true for `/login`/401
-/// re-auth (as opposed to the startup/logout flow).
+/// A login flow completed successfully.
+/// `method` is "xai" or "api_key"; `mode` is the resolved auth mode.
+/// `mid_session` is true for `/login`/401 re-auth (as opposed to the startup/logout flow).
 #[derive(Serialize)]
 pub struct LoginCompleted {
     pub method: String,
@@ -392,9 +415,13 @@ pub struct LoginCompleted {
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoginFailureKind {
-    /// `is_connect`: a dead TCP connect *or* a TLS handshake killed
-    /// mid-flight. `os_error` tells them apart.
+    /// `is_connect`: a dead TCP connect *or* a TLS handshake killed mid-flight.
+    /// `os_error` tells them apart.
     TransportConnect,
+    /// TLS certificate rejected for an untrusted issuer (e.g. an uninstalled proxy root).
+    CertificateUntrusted,
+    /// TLS certificate otherwise invalid (expired, wrong hostname).
+    CertificateInvalid,
     /// In-flight request cut short: reset, close, timeout, body phase.
     TransportInterrupted,
     /// Client-side request construction / redirect policy defect.
@@ -402,28 +429,24 @@ pub enum LoginFailureKind {
     Decode,
 }
 
-/// One per failed login attempt, emitted by the login funnel so a retried
-/// request can't inflate the count. Failures that never reached HTTP (user
-/// backed out, loopback bind, id_token validation) are not reported.
+/// One per failed login attempt, emitted by the login funnel so a retried request can't inflate the count.
+/// Failures that never reached HTTP (user backed out, loopback bind, id_token validation) are not reported.
 #[derive(Serialize)]
 pub struct LoginFailed {
     pub error_kind: LoginFailureKind,
-    /// OS code from the failure's cause chain (54/104 ECONNRESET, 10054 on
-    /// Windows).
+    /// OS code from the failure's cause chain (54/104 ECONNRESET, 10054 on Windows).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os_error: Option<i32>,
 }
 
-/// The user backed out of the login funnel. `stage` is "picker",
-/// "api_key_entry", "loopback_paste", "device_wait", "api_key_wait", or
-/// "command_wait"; `via` is "esc" or "quit".
+/// The user backed out of the login funnel.
+/// `stage` is "picker", "api_key_entry", "loopback_paste", "device_wait", "api_key_wait", or "command_wait"; `via` is "esc" or "quit".
 #[derive(Serialize)]
 pub struct LoginAbandoned {
     pub stage: String,
     pub via: String,
 }
 
-/// Result of persisting a user-provided API key.
 #[derive(Serialize)]
 pub struct ApiKeySaveResult {
     pub ok: bool,
@@ -441,14 +464,18 @@ pub struct PlanModeToggled {
     pub trigger: PlanModeTrigger,
     pub turn_in_flight: bool,
     pub was_previously_active: bool,
+    /// Previous permission-mode label (`default` / `plan` / `bypass_permissions`)
+    /// for the external `from_mode` attr. `#[serde(skip)]`.
+    #[serde(skip)]
+    pub from_mode: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Contextual tips
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// One contextual-hint impression or acceptance: per tip, how often it is
-/// shown vs. acted on (the `action` property drives the product-analytics funnel).
+/// One contextual-hint impression or acceptance: per tip, how often it is shown vs. acted on.
+/// The `action` property drives the product-analytics funnel.
 #[derive(Serialize)]
 pub struct ContextualTip {
     pub tip: ContextualTipKind,
@@ -459,19 +486,22 @@ pub struct ContextualTip {
 // Prompt suggestions (tab autocomplete ghost text)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// One predicted-next-prompt ghost impression or outcome. `shown` →
-/// `accepted` conversion is the acceptance rate of the tab-autocomplete
-/// feature; `dismissed` counts explicit Esc dismissals (a shown suggestion
-/// with neither outcome was implicitly ignored). No suggestion text is
-/// logged — only content-free metadata.
+/// Prompt-suggestion telemetry never includes suggestion text.
 #[derive(Serialize)]
 pub struct PromptSuggestion {
     pub action: PromptSuggestionAction,
-    /// Length of the full suggestion in characters (content-free size
-    /// signal: are long or short suggestions likelier to be accepted?).
+    /// Length of the full suggestion in characters (content-free size signal: are long or short suggestions likelier to be accepted?).
     pub chars: usize,
     /// Number of whitespace-separated words in the suggestion.
     pub words: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -483,6 +513,10 @@ pub struct YoloToggled {
     pub enabled: bool,
     pub previous_state: bool,
     pub trigger: YoloTrigger,
+    /// Previous permission mode (`default` / `plan` / `bypass_permissions`).
+    /// `None` falls back to yolo-only derivation from `previous_state`.
+    #[serde(skip)]
+    pub from_mode: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -518,6 +552,9 @@ pub struct CompactionTriggered {
     pub model_id: String,
     pub user_context_provided: bool,
     pub compaction_id: String,
+    pub compaction_mode: CompactionModeLabel,
+    pub two_pass_enabled: bool,
+    pub is_subagent: bool,
 }
 
 #[derive(Serialize)]
@@ -528,27 +565,78 @@ pub struct CompactionCompleted {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
     pub compaction_id: String,
+    pub compaction_mode: CompactionModeLabel,
+    pub two_pass: TwoPassOutcome,
+    pub segments_queued: u32,
+    pub degenerate_retries: u32,
+    pub input_overflow_retries: u32,
+    pub is_subagent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_compaction_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_compaction_ms: Option<u64>,
 }
 
-/// Emits paired `compaction_triggered` + `compaction_completed` events with
-/// a shared `compaction_id`. Guarantees both events fire and correlate.
+pub struct CompactionBeginParams {
+    pub trigger: CompactionTrigger,
+    pub tokens_used: u64,
+    pub context_window: u64,
+    pub model_id: String,
+    pub user_context_provided: bool,
+    pub compaction_mode: CompactionModeLabel,
+    pub two_pass_enabled: bool,
+    pub is_subagent: bool,
+}
+
+pub struct CompactionCompleteStats {
+    pub tokens_after: u64,
+    pub two_pass_used: bool,
+    pub segments_queued: u32,
+    pub degenerate_retries: u32,
+    pub input_overflow_retries: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct CompactionTiming {
+    pub model_wait_ms: Option<u64>,
+    pub pre_compaction_ms: Option<u64>,
+    pub post_compaction_ms: Option<u64>,
+}
+
+/// Emits `compaction_triggered` on `begin` and `compaction_completed` on `complete`, correlated by a shared `compaction_id`.
+/// A scope dropped without `complete` (error or cancel) emits no completion.
 pub struct CompactionScope {
     pub compaction_id: String,
     pub tokens_before: u64,
     pub model_id: String,
     start: std::time::Instant,
+    _active: crate::activity::ActivityGaugeGuard,
+    compaction_mode: CompactionModeLabel,
+    two_pass_enabled: bool,
+    is_subagent: bool,
 }
 
 impl CompactionScope {
-    pub fn begin(
-        trigger: CompactionTrigger,
-        tokens_used: u64,
-        context_window: u64,
-        model_id: String,
-        user_context_provided: bool,
-    ) -> Self {
+    pub fn begin(params: CompactionBeginParams) -> Self {
+        let CompactionBeginParams {
+            trigger,
+            tokens_used,
+            context_window,
+            model_id,
+            user_context_provided,
+            compaction_mode,
+            two_pass_enabled,
+            is_subagent,
+        } = params;
         let compaction_id = uuid::Uuid::new_v4().to_string();
         let percentage = xai_token_estimation::usage_percentage_u8(tokens_used, context_window);
+        let active = crate::activity::COMPACTIONS_ACTIVE.enter();
+        debug_assert!(
+            crate::activity::COMPACTIONS_ACTIVE.get() >= 1,
+            "CompactionTriggered must stamp a self-inclusive count"
+        );
         crate::session_ctx::log_event(CompactionTriggered {
             trigger,
             tokens_used,
@@ -557,29 +645,49 @@ impl CompactionScope {
             model_id: model_id.clone(),
             user_context_provided,
             compaction_id: compaction_id.clone(),
+            compaction_mode,
+            two_pass_enabled,
+            is_subagent,
         });
         Self {
             compaction_id,
             tokens_before: tokens_used,
             model_id,
             start: std::time::Instant::now(),
+            _active: active,
+            compaction_mode,
+            two_pass_enabled,
+            is_subagent,
         }
     }
 
-    pub fn complete(self, tokens_after: u64) {
+    pub fn complete(self, stats: CompactionCompleteStats, timing: CompactionTiming) {
+        let two_pass = match (self.two_pass_enabled, stats.two_pass_used) {
+            (false, _) => TwoPassOutcome::Disabled,
+            (true, true) => TwoPassOutcome::TwoPass,
+            (true, false) => TwoPassOutcome::SinglePass,
+        };
         crate::session_ctx::log_event(CompactionCompleted {
             duration_ms: self.start.elapsed().as_millis() as u64,
             tokens_before: self.tokens_before,
-            tokens_after,
+            tokens_after: stats.tokens_after,
             model_id: Some(self.model_id),
             compaction_id: self.compaction_id,
+            compaction_mode: self.compaction_mode,
+            two_pass,
+            segments_queued: stats.segments_queued,
+            degenerate_retries: stats.degenerate_retries,
+            input_overflow_retries: stats.input_overflow_retries,
+            is_subagent: self.is_subagent,
+            model_wait_ms: timing.model_wait_ms,
+            pre_compaction_ms: timing.pre_compaction_ms,
+            post_compaction_ms: timing.post_compaction_ms,
         });
     }
 }
 
-/// Auto-compaction suppressed after a deterministic failure so the turn loop stops
-/// re-firing a doomed compaction. Fires once per transition into the suppressed
-/// state; `reason` is a fixed classification: `credit_block | size | auth | schema | other`.
+/// Auto-compaction suppressed after a deterministic failure so the turn loop stops re-firing a doomed compaction.
+/// Fires once per transition into the suppressed state; `reason` is a fixed classification: `credit_block | size | auth | schema | other`.
 #[derive(Serialize)]
 pub struct AutoCompactSuppressed {
     pub reason: &'static str,
@@ -606,7 +714,7 @@ pub struct CompactionRetryDegraded {
 // Subagents
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Which spawn path owns a subagent's lifecycle.
+/// Which spawn path owns a subagent.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SubagentOwnerKind {
@@ -642,8 +750,7 @@ pub struct SubagentLaunched {
     /// Time parked in the admission queue; absent if admitted immediately.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queued_ms: Option<u64>,
-    /// The session's running non-workflow subagents at launch, including
-    /// this one; max per session is the session's peak concurrency.
+    /// The session's running non-workflow subagents at launch, including this one; max per session is the session's peak concurrency.
     pub session_running: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
@@ -668,6 +775,21 @@ pub struct SubagentCompleted {
     pub tool_calls: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_used: Option<u64>,
+    // Spawn-phase durations (`crate::subagent_spawn`, the `grok_code_subagent_spawn_*` taxonomy); absent when a phase did not run
+    // Populated through `SubagentSpawnTimer::write_event_phases`' single match, which fails to compile until a new phase is given a field below
+    // Phases are hierarchical (agent_build and tool_setup nest in session_bootstrap); summing all of them double-counts
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn_prepare_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_bootstrap_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_build_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_setup_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_to_first_turn_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -707,8 +829,7 @@ impl SubagentLimitHit {
         }
     }
 
-    /// The workflow pool's producer: waiters block on the run's semaphore,
-    /// so there is no queue depth to report.
+    /// The workflow pool's producer: waiters block on the run's semaphore, so there is no queue depth to report.
     pub fn workflow_run_concurrent(
         parent_session_id: String,
         workflow_run_id: String,
@@ -726,6 +847,25 @@ impl SubagentLimitHit {
             workflow_run_id: Some(workflow_run_id),
         }
     }
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitWaitOutcome {
+    Recovered,
+    BudgetSpent,
+    Unresolved,
+}
+
+/// Emitted once per inner `process_conversation_turn`, so one `turn_number` can carry several rows; do not blindly GROUP BY turn_number.
+#[derive(Serialize)]
+pub struct SubagentRateLimitWaited {
+    /// Resubmits (waits) this turn, excluding the initial send.
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub waited_ms: u64,
+    pub budget_ms: u64,
+    pub outcome: RateLimitWaitOutcome,
 }
 
 /// Where a workflow script came from.
@@ -753,8 +893,7 @@ pub struct WorkflowRunStarted {
     pub resumed: bool,
 }
 
-/// The run tracker's status labels, plus `superseded` for an episode whose
-/// run a quick resume took over.
+/// The run tracker's status labels, plus `superseded` for an episode whose run a quick resume took over.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowRunEndStatus {
@@ -914,6 +1053,7 @@ pub enum ExtensionsModalTab {
     Plugins,
     Marketplace,
     Skills,
+    Workflows,
     McpServers,
 }
 
@@ -966,10 +1106,23 @@ pub struct HookExecuted {
 #[derive(Serialize)]
 pub struct HookBlocked {
     pub hook_name: String,
+    pub cause: HookBlockCause,
 }
 
-/// Per-callback outcome of a `PreToolUse` gate. A deny returns early, so callbacks
-/// still pending at that point are not logged.
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum HookBlockCause {
+    Denied,
+    /// A `PreToolUse` `updatedInput` that could not be applied.
+    UnusableRewrite,
+    /// A `Stop`/`SubagentStop` hook blocked the agent from stopping.
+    StopBlocked,
+    /// A `UserPromptSubmit` hook blocked the prompt before the turn started.
+    PromptBlocked,
+}
+
+/// Per-callback outcome of a `PreToolUse` gate.
+/// A deny returns early, so callbacks still pending at that point are not logged.
 #[derive(Serialize)]
 pub struct ClientHookGate {
     pub callback_id: String,
@@ -1033,6 +1186,10 @@ pub struct McpServerFailed {
     pub error_type: McpErrorType,
     pub duration_ms: u64,
     pub timeout_sec: u64,
+    /// Failure text for the external `error_message` attr (CONTENT gate).
+    /// `#[serde(skip)]`.
+    #[serde(skip)]
+    pub error_message: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1076,9 +1233,7 @@ pub struct SessionHarness {
     pub agents_md_dir_names: Vec<String>,
     pub memory_enabled: bool,
     pub memory_retrieval_mode: MemoryRetrievalMode,
-    /// Whether the session cwd is inside a git repo (same value `SessionNew`
-    /// carries). Additive analytics-visible field, added for the external
-    /// `session_start` event (design ‡ footnote).
+    /// Whether the session cwd is inside a git repo (same value `SessionNew` carries); the external `session_start` event reads it.
     pub is_git_repo: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_update: Option<bool>,
@@ -1113,18 +1268,19 @@ pub struct PromptSubmitted {
     pub model_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_identifier: Option<String>,
-    /// Pager screen mode from the prompt request `_meta.screenMode`
-    /// (`fullscreen` | `inline` | `minimal` | `headless`). `None` for
-    /// non-pager clients and synthetic prompts (goal summaries, drains,
-    /// interjections).
+    /// Pager screen mode from the prompt request `_meta.screenMode` (`fullscreen` | `inline` | `minimal` | `headless`).
+    /// `None` for non-pager clients and synthetic prompts (goal summaries, drains, interjections).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_mode: Option<String>,
-    /// Raw prompt text for the external stream's `OTEL_LOG_USER_PROMPTS`
-    /// gate **only**. `#[serde(skip)]`: never serialized to product events/analytics;
-    /// dropped at external emit time unless the gate is on (then capped at
-    /// 60 KB and secret-scrubbed).
+    /// Raw prompt text for the external stream's `OTEL_LOG_USER_PROMPTS` gate **only**.
+    /// `#[serde(skip)]`: never serialized to product events/analytics.
+    /// Dropped at external emit time unless the gate is on (then capped at 60 KB and secret-scrubbed).
     #[serde(skip)]
     pub prompt_text: Option<String>,
+    /// Slash/skill command name for the external `command_name` attr.
+    /// Always-on metadata (not user prompt text). `#[serde(skip)]`.
+    #[serde(skip)]
+    pub command_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1146,12 +1302,11 @@ pub struct RolloutSurvey {
 }
 
 /// PR created via the session (bash `gh pr create` or MCP create_pull_request).
-/// Counts only — PR url/number stay in the turn_result.json signals, not here.
+/// Counts only: PR url/number stay in the turn_result.json signals.
 #[derive(Serialize)]
 pub struct PrCreated {
     pub source: PrCreationSource,
-    /// Whether the session recorded a `git commit` before the create
-    /// (end-to-end attribution vs unknown work start).
+    /// Whether the session recorded a `git commit` before the create; separates work done end to end in the session from work started elsewhere.
     pub had_commit_in_session: bool,
 }
 
@@ -1230,8 +1385,7 @@ pub struct NonGitDecisionEvent {
 // Prompt Latency (every turn)
 // ---------------------------------------------------------------------------
 
-/// Why a [`ProcessResourceUsage`] was sampled, so a mid-life reading is not
-/// read as a post-teardown one.
+/// Why a [`ProcessResourceUsage`] was sampled, so a mid-life reading is not read as a post-teardown one.
 #[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceReportTrigger {
@@ -1239,8 +1393,8 @@ pub enum ResourceReportTrigger {
     Periodic,
 }
 
-/// The ceilings this process runs under. The denominator for
-/// `ProcessResourceUsage`: usage against limits is headroom.
+/// The ceilings this process runs under.
+/// The denominator for `ProcessResourceUsage`: usage against limits is headroom.
 #[derive(Serialize)]
 pub struct ProcessResourceLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1270,9 +1424,9 @@ pub struct HeapThresholdCrossed {
     pub rss_peak_bytes: Option<u64>,
 }
 
-/// What this process still holds just after a session was removed. Aggregated
-/// per release, a rising tail is a leak; `resident_sessions` separates leader
-/// mode, where one process serves many sessions and a leak compounds.
+/// What this process still holds just after a session was removed.
+/// Aggregated per release, a rising tail is a leak.
+/// `resident_sessions` separates leader mode, where one process serves many sessions and a leak compounds.
 #[derive(Serialize)]
 pub struct ProcessResourceUsage {
     pub trigger: ResourceReportTrigger,
@@ -1283,11 +1437,14 @@ pub struct ProcessResourceUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub footprint_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocated_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub threads: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_files: Option<u64>,
     pub resident_sessions: usize,
     pub session_threads: usize,
+    pub idle: bool,
 }
 
 #[derive(Serialize)]
@@ -1296,12 +1453,20 @@ pub struct PromptLatency {
     pub total_ms: u64,
     pub mcp_wait_ms: u64,
     pub tool_collection_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_status_wait_ms: Option<u64>,
     pub model_call_ms: u64,
     pub pre_model_ms: u64,
     pub mcp_server_count: u32,
     pub mcp_tools_registered: u32,
     pub mcp_strategy: McpStrategy,
     pub model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    pub ttlb_ms: u64,
+    pub attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,9 +1485,33 @@ pub struct TurnCompleted {
     pub error_category: Option<String>,
 }
 
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationScope {
+    Turn,
+    Compaction,
+}
+
+#[derive(Serialize, Clone, Copy)]
+pub struct CancellationCompleted {
+    pub latency_ms: u64,
+    pub scope: CancellationScope,
+}
+
 /// Model issued a shell tool call whose command is `true` (keepalive thrash signal).
 #[derive(Serialize)]
 pub struct ShellTrueNoop {
+    pub tool_name: String,
+}
+
+/// Harness nudged the model to break a run of identical tool calls.
+/// Pairs with [`ActionStationarityStop`]: the nudge fires first and once per run, the stop only if the run continues to the hard limit.
+/// `problematically_repeating` splits the two threshold tiers (tools whose identical repeats are never productive versus everything else).
+/// Nudge and stop each break down by tier.
+#[derive(Serialize)]
+pub struct ActionStationarityNudge {
+    pub problematically_repeating: bool,
+    pub run_len: u32,
     pub tool_name: String,
 }
 
@@ -1330,6 +1519,7 @@ pub struct ShellTrueNoop {
 #[derive(Serialize)]
 pub struct ActionStationarityStop {
     pub true_noop: bool,
+    pub problematically_repeating: bool,
     pub run_len: u32,
     pub tool_name: String,
 }
@@ -1342,17 +1532,30 @@ pub struct ActionStationarityStop {
 pub struct ToolCallCompleted {
     pub tool_name: String,
     pub outcome: xai_grok_session_events::types::ToolOutcome,
+    /// Content-free: the hook name is kept out of OTLP and product events and rides only the session-event row.
+    pub hook_rewrote: bool,
     pub duration_ms: u64,
-    /// Primary file path of the call, for the external stream only
-    /// (`#[serde(skip)]`: never serialized to product events/analytics). Always reduced to
-    /// `file_extension`; the full path rides the `OTEL_LOG_TOOL_DETAILS` gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_size_bytes: Option<u64>,
+    /// Primary file path of the call, for the external stream only (`#[serde(skip)]`: never serialized to product events/analytics).
+    /// Always reduced to `file_extension`; the full path rides the `OTEL_LOG_TOOL_DETAILS` gate.
     #[serde(skip)]
     pub file_path: Option<String>,
     /// Tool parameters for the external stream's `OTEL_LOG_TOOL_DETAILS`
-    /// gate **only** (`#[serde(skip)]`; reduced to 4 KB / depth 2 / 20 items
-    /// at emit time).
+    /// 4 KB preview **and** `OTEL_LOG_TOOL_CONTENT` full `tool_input`
+    /// (`#[serde(skip)]`; reduced / capped at emit time).
     #[serde(skip)]
     pub parameters: Option<serde_json::Value>,
+    /// Tool-call id for the external stream (`#[serde(skip)]`; always-on
+    /// join key, not content).
+    #[serde(skip)]
+    pub tool_use_id: Option<String>,
+    /// Tool result body for `OTEL_LOG_TOOL_CONTENT` (`#[serde(skip)]`).
+    #[serde(skip)]
+    pub tool_output: Option<String>,
+    /// Failure text for `OTEL_LOG_TOOL_CONTENT` (`#[serde(skip)]`).
+    #[serde(skip)]
+    pub error_message: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,6 +1576,27 @@ pub struct ModelResponseReceived {
     pub reasoning_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    /// USD ticks (1e10 ticks = $1); `None` when unpriced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd_ticks: Option<i64>,
+}
+
+/// Assembled assistant **text** for the external stream. Emitted once per
+/// turn via [`crate::external::emit`] (not [`crate::session_ctx::log_event`]),
+/// so Mixpanel never receives `assistant_response`. Thinking/tool-use blocks
+/// are excluded at the source. `response_length` always exports on the
+/// external event; `response_text` is `#[serde(skip)]` and gated by
+/// `OTEL_LOG_ASSISTANT_RESPONSES`.
+#[derive(Serialize)]
+pub struct AssistantResponse {
+    /// Char/byte count of the assembled text blocks (always-on, like
+    /// `prompt_length`). Zero on tool-only turns.
+    pub response_length: usize,
+    /// Gated by `OTEL_LOG_ASSISTANT_RESPONSES`; omitted when length is 0.
+    #[serde(skip)]
+    pub response_text: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1411,6 +1635,63 @@ pub struct SessionEnded {
     pub model_id: String,
 }
 
+/// `total_ms` is the wall-clock of the whole teardown.
+/// The other fields are individual steps, so `total_ms - sum(steps)` is time spent outside the measured steps.
+/// Emitted once after feedback so late phases are not dropped: `SessionEnded` fires mid-teardown.
+#[derive(Serialize, Default)]
+pub struct SessionEndTimings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_save_ms: Option<u64>,
+    /// Intentionally unpopulated; retained because downstream metrics consumers still read this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_consolidate_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_dispatch_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hooks_stop_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflows_drain_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflows_persist_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback_drain_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_tasks_save_ms: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Auth lock contention (aggregate layer; unified_log carries the forensics)
+// ---------------------------------------------------------------------------
+
+/// A contended `auth.json.lock` acquisition; instant acquisitions stay silent.
+#[derive(Serialize)]
+pub struct AuthLockWait {
+    pub wait_ms: u64,
+    pub budget_ms: u64,
+}
+
+/// An `auth.json.lock` wait that exhausted its budget.
+#[derive(Serialize)]
+pub struct AuthLockTimeout {
+    pub budget_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_state: Option<&'static str>,
+}
+
+/// A held lock's file was replaced out from under it: an unlink-recovery binary is still active in the fleet.
+/// The holder fields describe the replacer.
+#[derive(Serialize)]
+pub struct AuthLockReplacedOutFromUnder {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_age_secs: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Pager events (called from xai-grok-pager via log_event)
 // ---------------------------------------------------------------------------
@@ -1431,14 +1712,24 @@ pub struct AgentConnect {
     pub auth_mode: crate::startup::AuthMode,
 }
 
-/// End to end startup: process start to a usable session, with the phase
-/// breakdown that accounts for it.
 #[derive(Serialize)]
-pub struct StartupComplete {
+pub struct StartupCompleted {
     pub total_ms: u64,
     pub outcome: crate::startup::StartupOutcome,
     pub phases: String,
     pub auth_mode: crate::startup::AuthMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefetch_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_load_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_replay_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_git_scan_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_spawn_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_first_frame_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1452,6 +1743,16 @@ pub struct PlanSubmit {
     pub action: String,
 }
 
+#[derive(Serialize)]
+pub struct EventLoopStall {
+    pub max_stall_ms: u64,
+    pub window_ms: u64,
+    pub events_handled: u32,
+    pub stall_compaction_active: bool,
+    pub stall_subagents_active: u32,
+    pub stall_mcp_servers_connected: u32,
+}
+
 // ---------------------------------------------------------------------------
 // SuperGrok upsell
 // ---------------------------------------------------------------------------
@@ -1461,11 +1762,9 @@ pub struct PlanSubmit {
 pub enum SuperGrokUpsell {
     WelcomeScreen,
     RateLimitError,
-    /// Free-usage-exhausted paywall modal (free-tier 429 with the
-    /// `subscription:free-usage-exhausted` well-known error code).
+    /// Free-usage-exhausted paywall modal (free-tier 429 with the `subscription:free-usage-exhausted` well-known error code).
     FreeUsagePaywall,
-    /// Upsell modal shown when a tier-restricted slash command
-    /// (`/usage`, `/imagine`, …) is invoked on the free / X Basic tiers.
+    /// Upsell modal shown when a tier-restricted slash command (`/usage`, `/imagine`, …) is invoked on the free / X Basic tiers.
     RestrictedCommand,
 }
 
@@ -1484,10 +1783,9 @@ pub struct SuperGrokUpsellClicked {
 }
 
 /// Which surface a promo announcement's upgrade CTA was activated from.
-/// Modeled on [`SuperGrokUpsell`]; lets the funnel attribute the click to the
-/// welcome hero vs the in-session header vs the banner vs the dashboard, and
-/// distinguish keyboard (`Ctrl+O`) activations from pointer/OSC 8 ones.
-/// Ord/Eq exist for the pager's per-(announcement, surface) impression latch.
+/// Modeled on [`SuperGrokUpsell`]; lets the funnel attribute the click to the welcome hero vs the in-session header vs the banner vs the dashboard.
+/// Also distinguishes keyboard (`Ctrl+O`) activations from pointer/OSC 8 ones.
+/// Ord/Eq exist so the pager can track which (announcement, surface) pairs already showed the CTA.
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum AnnouncementCtaSurface {
@@ -1498,11 +1796,8 @@ pub enum AnnouncementCtaSurface {
     Keyboard,
 }
 
-/// A promo announcement's CTA button was painted on a surface — the
-/// impression half of the per-surface CTR funnel with
-/// [`AnnouncementCtaClicked`]. Emitted once per (announcement, surface) per
-/// pager process (cleared on logout); never emitted for `Keyboard` (a
-/// click-only surface).
+/// A promo announcement's CTA button was painted on a surface: the impression half of the per-surface CTR funnel with [`AnnouncementCtaClicked`].
+/// Emitted once per (announcement, surface) per pager process (cleared on logout); never emitted for `Keyboard` (a click-only surface).
 #[derive(Serialize)]
 pub struct AnnouncementCtaShown {
     /// Announcement `id` from the server push (`None` for id-less items).
@@ -1527,6 +1822,8 @@ pub struct AnnouncementCtaClicked {
 pub enum CodingDataConsentSource {
     PrivacyBanner,
     Settings,
+    /// "Opt in" on the `/feedback` trace-consent card while individually opted out.
+    FeedbackTraceCard,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -1550,6 +1847,32 @@ pub struct CodingDataConsentSelected {
     pub changed: bool,
 }
 
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackTraceConsentChoice {
+    /// "Opt in".
+    TurnOn,
+    /// "Opt out this time", also the Esc/skip outcome.
+    NoUpload,
+    /// "Opt out and don't ask again".
+    NeverAsk,
+}
+
+/// The `/feedback` trace-consent card was shown (funnel denominator for [`FeedbackTraceConsentSelected`]).
+#[derive(Serialize)]
+pub struct FeedbackTraceCardShown {
+    /// The "yes" option disclosed that it re-enables coding-data sharing.
+    pub reenables_sharing: bool,
+}
+
+/// Outcome of the `/feedback` trace-consent card (only emitted when the card was shown).
+#[derive(Serialize)]
+pub struct FeedbackTraceConsentSelected {
+    pub choice: FeedbackTraceConsentChoice,
+    /// The "yes" option disclosed that it re-enables coding-data sharing.
+    pub reenables_sharing: bool,
+}
+
 /// Flat snapshot of the terminal environment for telemetry.
 ///
 /// Shared across pager events so terminal fields are typed once.
@@ -1563,14 +1886,13 @@ pub struct TerminalTelemetry {
     pub term_var: String,
     pub tmux_version: String,
     pub xtversion: String,
-    /// Raw, as its source reported it — shapes vary (`"3.5.6"`,
-    /// `"20240203-110809-5046fc22"`, `"7402"`). Empty when unknown.
+    /// Raw, as its source reported it; shapes vary (`"3.5.6"`, `"20240203-110809-5046fc22"`, `"7402"`).
+    /// Empty when unknown.
     pub term_version: String,
     pub term_version_source: String,
-    /// The Kitty protocol was negotiated *without* `REPORT_EVENT_TYPES` because
-    /// `term_version` identified a build that mis-encodes key releases
-    /// (Alacritty ≤ 0.14.x). A field rather than its own event so the affected
-    /// population always has a denominator.
+    /// The Kitty protocol was negotiated *without* `REPORT_EVENT_TYPES`.
+    /// `term_version` identified a build that mis-encodes key releases (Alacritty 0.14.x and earlier).
+    /// A field rather than its own event so the affected population always has a denominator.
     pub kitty_event_types_withheld: bool,
     pub host_os: String,
     pub display_server: String,
@@ -1581,12 +1903,11 @@ pub struct TerminalTelemetry {
     pub hyperlink_skip_reason: String,
     pub clipboard_route: String,
     pub clipboard_native_tool: String,
-    /// Wayland data-control protocol availability: "yes" | "no" | "n/a"
-    /// (n/a off Wayland).
+    /// Wayland data-control protocol availability: "yes" | "no" | "n/a" (n/a off Wayland).
     pub clipboard_data_control: String,
 }
 
-/// One-shot OS primary-display refresh probe + auto-cadence decision at process start.
+/// One-shot OS primary-display refresh probe and auto-cadence decision at process start.
 #[derive(Serialize)]
 pub struct DisplayRefreshProbe {
     #[serde(flatten)]
@@ -1610,14 +1931,13 @@ pub struct DisplayRefreshProbe {
     pub auto_cadence_reason: String,
 }
 
-/// Emitted once per system-clipboard attachment read during paste
-/// (Ctrl/Cmd+V). Diagnoses silent image-paste failures, e.g. Wayland-only
-/// sessions where the X11 CLIPBOARD probe comes back empty.
+/// Emitted once per system-clipboard attachment read during paste (Ctrl/Cmd+V).
+/// Diagnoses silent image-paste failures, e.g. Wayland-only sessions where the X11 CLIPBOARD probe comes back empty.
 #[derive(Serialize)]
 pub struct ClipboardImagePaste {
     #[serde(flatten)]
     pub terminal: TerminalTelemetry,
-    /// Which read ran: "attachments" (file URLs + image) or "image".
+    /// Which read ran: "attachments" (file URLs and image) or "image".
     pub probe: String,
     /// "image" | "file_urls" | "empty" | "error".
     pub outcome: String,
@@ -1627,9 +1947,9 @@ pub struct ClipboardImagePaste {
     pub duration_ms: u64,
 }
 
-/// Emitted when Ctrl/Cmd+V (paste key) is handled but the **host** process
-/// clipboard has no pasteable text/image/file URLs. Diagnoses silent no-ops
-/// on remote/ETX sessions. Does not change paste behavior.
+/// Emitted when Ctrl/Cmd+V (paste key) is handled but the **host** process clipboard has no pasteable text/image/file URLs.
+/// Diagnoses silent no-ops on remote/ETX sessions.
+/// Does not change paste behavior.
 #[derive(Serialize)]
 pub struct PasteKeyEmptyHostClipboard {
     #[serde(flatten)]
@@ -1640,9 +1960,8 @@ pub struct PasteKeyEmptyHostClipboard {
 
 /// Emitted once per user-visible text copy (`copy_text` / TUI yank, etc.).
 ///
-/// Captures per-leg write outcomes so we can diagnose "copy doesn't work"
-/// reports (e.g. Wayland + xclip probe; did wl-copy actually succeed?) without
-/// relying on toast text alone.
+/// Captures per-leg write outcomes so we can diagnose "copy doesn't work" reports without relying on toast text alone.
+/// E.g. on Wayland with the xclip probe: did wl-copy actually succeed?
 #[derive(Serialize)]
 pub struct ClipboardCopy {
     #[serde(flatten)]
@@ -1660,17 +1979,15 @@ pub struct ClipboardCopy {
     /// CLI tools actually invoked, `+`-joined (e.g. `wl-copy+xclip`); empty if none.
     pub cli_tools_tried: String,
     /// CLI tools that returned Ok, `+`-joined; empty if none succeeded.
-    /// On Wayland, wl-copy is read-back-verified only when `data_control` is
-    /// false; with `data_control && arboard_ok` its exit-0 is credited
-    /// unverified (the arboard write is authoritative) — condition wl-copy
-    /// success rates on `data_control`.
+    /// On Wayland, wl-copy is read-back-verified only when `data_control` is false.
+    /// With `data_control && arboard_ok` its exit-0 is credited unverified (the arboard write is authoritative).
+    /// Condition wl-copy success rates on `data_control`.
     pub cli_ok_tools: String,
     pub cli_ok: bool,
     pub arboard_ok: bool,
-    /// The Wayland data-control protocol was available for this write (the
-    /// environment probe — NOT proof the arboard write landed; a focus-free
-    /// authoritative write additionally requires `arboard_ok`). Always false
-    /// off-Wayland.
+    /// The Wayland data-control protocol was available for this write (the environment probe, NOT proof the arboard write landed).
+    /// A focus-free authoritative write additionally requires `arboard_ok`.
+    /// Always false off-Wayland.
     pub data_control: bool,
     pub tmux_ok: bool,
     pub osc52_ok: bool,
@@ -1687,8 +2004,8 @@ pub struct ClipboardCopy {
     pub duration_ms: u64,
 }
 
-/// Emitted when backspace/delete is pressed but produces no text change
-/// on a non-empty prompt. Used to diagnose the "backspace lock" bug.
+/// Emitted when backspace/delete is pressed but produces no text change on a non-empty prompt.
+/// Used to diagnose the "backspace lock" bug.
 #[derive(Serialize)]
 pub struct BackspaceNoEffect {
     #[serde(flatten)]
@@ -1701,8 +2018,8 @@ pub struct BackspaceNoEffect {
     pub has_selection: bool,
 }
 
-/// Emitted each time a terminal notification is actually sent (not filtered
-/// by condition or event kind). Used for protocol distribution analysis.
+/// Emitted each time a terminal notification is actually sent (not filtered by condition or event kind).
+/// Used for protocol distribution analysis.
 #[derive(Serialize)]
 pub struct NotificationEmitted {
     pub protocol: &'static str,
@@ -1719,19 +2036,15 @@ pub struct DashboardOpened {
 
 /// User pressed an allowlisted registry shortcut.
 ///
-/// **Product contract (authoritative):** intent-only telemetry for the
-/// bindings that can own **Ctrl+L**. Emits when the chord resolves to the
-/// action, whether the effect succeeds, defers, or soft-no-ops. Soft no-ops
-/// still count as intent.
+/// Intent-only telemetry for the bindings that can own **Ctrl+L**.
+/// Emits when the chord resolves to the action, whether the effect succeeds, defers, or soft-no-ops; soft no-ops still count as intent.
+/// Allowlist: `interject_prompt` and `open_extensions`.
+/// `interject_prompt` is often Ctrl+L in the VS Code family, elsewhere the interject/send-now chord; `open_extensions` is Ctrl+L on other terminals.
+/// Absence of other actions is not “unused.”
+/// Expand the allowlist deliberately; this is not full-registry coverage.
 ///
-/// Allowlist: `interject_prompt` (VS Code family often Ctrl+L; elsewhere the
-/// interject/send-now chord) and `open_extensions` (Ctrl+L on other
-/// terminals). Absence of other actions is not “unused.” Expand the allowlist
-/// deliberately; this is not full-registry coverage.
-///
-/// Fields are content-free. `key` is a platform-stable encoding (`Ctrl+L`,
-/// not locale-specific `Cmd`/`Opt` or mixed case). `context` is a surface
-/// label (`prompt_focused`, `agent_screen`, `queue`, …).
+/// Fields are content-free.
+/// `key` is a platform-stable encoding (`Ctrl+L`, not locale-specific `Cmd`/`Opt` or mixed case).
 #[derive(Serialize)]
 pub struct ShortcutUsed {
     /// Stable chord encoding (`Ctrl+L`, `Ctrl+Enter`, …).
@@ -1761,8 +2074,8 @@ pub struct DashboardAgentLaunched {
 // Rate limiting
 // ---------------------------------------------------------------------------
 
-/// Emitted when a user's turn fails due to rate limiting (all retries
-/// exhausted). Key conversion-funnel signal: rate limit → upsell → subscribe.
+/// Emitted when a user's turn fails due to rate limiting (all retries exhausted).
+/// Key conversion-funnel signal: rate limit, then upsell, then subscribe.
 #[derive(Serialize)]
 pub struct RateLimitHit {
     pub model_id: String,
@@ -1770,8 +2083,8 @@ pub struct RateLimitHit {
     pub attempts: u32,
 }
 
-/// Model-API failure at the turn level (non-rate-limit). Category/class only
-/// — no message text (external `api_error` event; also a product event).
+/// Model-API failure at the turn level (non-rate-limit).
+/// Category/class only, no message text (external `api_error` event; also a product event).
 #[derive(Serialize)]
 pub struct ApiError {
     /// Fixed classification (`auth`, `server_error`, `timeout`, …).
@@ -1784,7 +2097,7 @@ pub struct ApiError {
 }
 
 /// Internal (our-code) error class for the external `internal_error` event.
-/// Error class only — no message, no location (user decision, RQ5).
+/// Error class only: no message, no location.
 #[derive(Serialize)]
 pub struct InternalError {
     pub error_type: String,
@@ -1795,9 +2108,8 @@ pub struct InternalError {
 // never exported externally)
 // ---------------------------------------------------------------------------
 
-/// Emitted once per process (post-auth) when the external OTEL stream is
-/// configured. Endpoint reduced to `scheme://host[:port]` — we measure
-/// adoption without learning collector details.
+/// Emitted once per process (post-auth) when the external OTEL stream is configured.
+/// Endpoint reduced to `scheme://host[:port]`; we measure adoption without learning collector details.
 #[derive(Serialize)]
 pub struct ExternalOtelConfigured {
     pub metrics_exporter: String,
@@ -1807,6 +2119,8 @@ pub struct ExternalOtelConfigured {
     pub metrics_endpoint_origin: String,
     pub prompts_gate: bool,
     pub details_gate: bool,
+    pub assistant_gate: bool,
+    pub content_gate: bool,
     /// Startup source of the master switch: `env` | `config`.
     pub source: String,
 }
@@ -1818,8 +2132,7 @@ pub struct ExternalOtelRemotePolicyApplied {
     pub action: String,
 }
 
-/// Export-health counters for the external stream, emitted on the internal
-/// pipeline at shutdown (never externally — avoid feedback loops).
+/// Export-health counters for the external stream, emitted on the internal pipeline at shutdown (never externally, to avoid feedback loops).
 #[derive(Serialize)]
 pub struct ExternalOtelExportHealth {
     pub records_dropped: u64,
@@ -1828,11 +2141,37 @@ pub struct ExternalOtelExportHealth {
     pub export_successes: u64,
 }
 
+/// Once per session. Carries no `command` string or script output.
+#[derive(Serialize)]
+pub struct StatusLineConfigured {
+    /// `unset` when the config named no mode, which is adoption's denominator.
+    pub kind: &'static str,
+    /// Always `false` once the user wrote `type = "disabled"`, and reported even by a client that draws no row.
+    pub row_shows_a_problem: bool,
+    pub items: String,
+    pub custom_items: bool,
+}
+
+/// How the status line fared, at shutdown, for every session that enabled it.
+#[derive(Serialize)]
+pub struct StatusLineHealth {
+    pub kind: &'static str,
+    /// A run's error text counts, a config diagnostic does not, so `false` can still mean a bar that showed one all session.
+    pub had_content: bool,
+    pub runs_ok: u64,
+    /// Shown on the row as `[status line: …]`.
+    pub runs_failed: u64,
+    pub runs_timed_out: u64,
+    /// Given up on; counted again under its outcome if it ever lands.
+    pub runs_abandoned: u64,
+    pub slowest_ms: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Credit limit
 // ---------------------------------------------------------------------------
 
-/// 403 "run out of credits" — billing exhaustion (not request throttling).
+/// 403 "run out of credits": billing exhaustion (not request throttling).
 #[derive(Serialize)]
 pub struct CreditLimitHit {
     pub model_id: String,
@@ -1841,9 +2180,9 @@ pub struct CreditLimitHit {
 #[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum CreditLimitUpsellSurface {
-    /// Q&A modal with "Upgrade tier" + "Pay as you go" options (non-max-tier).
+    /// Q&A modal (upgrade, buy / PAYG, and try again; or buy and try again at max-tier).
     QuestionModal,
-    /// Inline scrollback card with PAYG link (max-tier / Heavy users).
+    /// Retired: max-tier used an inline scrollback card. Kept for historical events.
     InlineCard,
 }
 
@@ -1853,8 +2192,8 @@ pub struct CreditLimitUpsellShown {
     pub surface: CreditLimitUpsellSurface,
     pub max_tier: bool,
     pub pay_as_you_go: bool,
-    /// User is on unified usage billing (buy-credits wording). When false,
-    /// legacy on-demand / PAYG wording was used.
+    /// User is on unified usage billing (buy-credits wording).
+    /// When false, legacy on-demand / PAYG wording was used.
     #[serde(default)]
     pub unified_billing: bool,
 }
@@ -1867,6 +2206,8 @@ pub enum CreditLimitChoice {
     PayAsYouGo,
     /// Unified-billing / credits-pool users: purchase prepaid credits.
     PurchaseCredits,
+    /// Resubmit the prompt that hit the credit limit.
+    RetryLastPrompt,
 }
 
 /// User clicked an option in the credit-limit upsell.
@@ -1880,33 +2221,28 @@ pub struct CreditLimitUpsellClicked {
 // Subscription conversion
 // ---------------------------------------------------------------------------
 
-/// Emitted when a previously access-gated user re-authenticates and the gate
-/// is lifted — i.e. they subscribed (externally on grok.com) and came back.
-/// This is the actual conversion signal for SuperGrok Heavy subscriptions
-/// attributed to Grok Build: the user saw the gate in Grok Build, went and
-/// paid, then returned with access.
+/// Emitted when a previously access-gated user re-authenticates and the gate is lifted, i.e. they subscribed (externally on grok.com) and came back.
+/// This is the actual conversion signal for SuperGrok Heavy subscriptions attributed to Grok Build.
+/// The user saw the gate in Grok Build, went and paid, then returned with access.
 #[derive(Serialize)]
 pub struct SubscriptionActivated {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
-    /// Whether the subscribe CTA was shown in this session before the gate
-    /// was lifted (`access_gate_shown_logged`). When `true`, the conversion
-    /// is strongly attributable to Grok Build's upsell surface.
+    /// Whether the subscribe CTA was shown in this session before the gate was lifted (`access_gate_shown_logged`).
+    /// When `true`, the conversion is strongly attributable to Grok Build's upsell surface.
     pub upsell_shown_this_session: bool,
 }
 
-/// Why auth recovery could not refresh the credential, forcing the user to
-/// manually re-authenticate. Mapped from shell's `AuthError`; only terminal
-/// failures map — transient ones don't emit (recovery retries).
+/// Why auth recovery could not refresh the credential, forcing the user to manually re-authenticate.
+/// Mapped from shell's `AuthError`; only terminal failures map, transient ones don't emit (recovery retries).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum ManualAuthReason {
     /// IdP rejected the refresh token (`invalid_grant`); a re-login is required.
     RefreshTokenRejected,
-    /// Token type has no refresh authority (API key / legacy / OIDC sans refresh token).
+    /// Token type has no refresh authority (API key / legacy / OIDC without a refresh token).
     NoRefreshAuthority,
-    /// The operator's auth-provider command could not mint a credential
-    /// unattended, so only an interactive run of it can restore the session.
+    /// The operator's auth-provider command could not mint a credential unattended, so only an interactive run of it can restore the session.
     ProviderInteractiveRequired,
     RecoveryExhausted,
     TokenExpiredNoRefresh,
@@ -1914,8 +2250,8 @@ pub enum ManualAuthReason {
     WrongTeam,
 }
 
-/// User-facing surface where the manual re-auth was triggered. Background
-/// recoveries (storage/telemetry uploads) do not emit this event.
+/// User-facing surface where the manual re-auth was triggered.
+/// Background recoveries (storage/telemetry uploads) do not emit this event.
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum ManualAuthSurface {
@@ -1925,8 +2261,8 @@ pub enum ManualAuthSurface {
     Relay,
 }
 
-/// The kind of bearer that was rejected. Mirrors shell's `TokenType` as a
-/// stable wire enum (don't serialize the shell `Debug` repr).
+/// The kind of bearer that was rejected.
+/// Mirrors shell's `TokenType` as a stable wire enum (don't serialize the shell `Debug` repr).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthTokenKind {
@@ -1937,19 +2273,18 @@ pub enum AuthTokenKind {
     None,
 }
 
-/// KPI: a user-facing 401 recovery (`Turn`/`Relay`) terminally failed, forcing a
-/// manual re-login. Product-events only (no external export).
+/// KPI: a user-facing 401 recovery (`Turn`/`Relay`) terminally failed, forcing a manual re-login.
+/// Product-events only (no external export).
 ///
-/// Alerting contract: the event lands under the Shell-origin name
-/// `grok-shell-manual_auth` (the `manual_auth` binding gets the `grok-shell-`
-/// prefix at emit). Count `distinct(principal)`, never raw events — the debounce
-/// is a single slot per process (repeats on the most-recent dead credential
-/// collapse; alternating credentials can re-emit), and `trigger` is whichever
-/// surface fired first, not a reliable per-surface split. `principal` is absent for
-/// unattributed lockouts (all collapse into one NULL bucket). API-key sessions
-/// are excluded (a 401 there means rotate the key, not `/login`).
+/// Alerting contract: the event lands under the Shell-origin name `grok-shell-manual_auth`.
+/// The `manual_auth` binding gets the `grok-shell-` prefix at emit.
+/// Count `distinct(principal)`, never raw events.
+/// The debounce is a single slot per process; it repeats on the most-recent dead credential collapse, and alternating credentials can re-emit.
+/// `trigger` is whichever surface fired first, not a reliable per-surface split.
+/// `principal` is absent for unattributed lockouts (all collapse into one NULL bucket).
+/// API-key sessions are excluded (a 401 there means rotate the key, not `/login`).
 // `Debug`/`Clone`/`PartialEq` let shell tests assert the emitted event by value
-// (a downstream crate's `cfg(test)` can't turn on `cfg_attr(test, ...)` here).
+// A downstream crate's `cfg(test)` can't turn on `cfg_attr(test, ...)` here
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct ManualAuth {
     pub reason: ManualAuthReason,
@@ -1960,8 +2295,7 @@ pub struct ManualAuth {
     pub principal: Option<String>,
 }
 
-/// Release channel bucketed to the known set: channel is free-text user
-/// config, and recording it verbatim would leak private mirror names.
+/// Release channel bucketed to the known set: channel is free-text user config, and recording it verbatim would leak private mirror names.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CliUpdateChannel {
@@ -1972,8 +2306,7 @@ pub enum CliUpdateChannel {
 }
 
 impl CliUpdateChannel {
-    /// Empty means stable — the installers' default (mirrors the updater's
-    /// `is_stable_channel`).
+    /// Empty means stable, the installers' default (mirrors the updater's `is_stable_channel`).
     pub fn from_channel_str(raw: &str) -> Self {
         match raw.trim() {
             "" | "stable" => Self::Stable,
@@ -1984,9 +2317,9 @@ impl CliUpdateChannel {
     }
 }
 
-/// One attempt to download + activate a new `grok` binary. Analytics name:
-/// `grok-shell-cli_update`. Emitted on failure too; failures carry the
-/// typed `error_kind` only — freeform strings leak home paths.
+/// One attempt to download and activate a new `grok` binary.
+/// Analytics name: `grok-shell-cli_update`.
+/// Emitted on failure too; failures carry the typed `error_kind` only (freeform strings leak home paths).
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct CliUpdate {
     pub outcome: CliUpdateOutcome,
@@ -1996,7 +2329,7 @@ pub struct CliUpdate {
     pub to_version: Option<String>,
     pub channel: CliUpdateChannel,
     pub installer: CliUpdateInstaller,
-    /// `{os}-{arch}` from platform detection — closed by construction.
+    /// `{os}-{arch}` from platform detection; closed by construction.
     pub platform: String,
     pub rosetta: bool,
     pub duration_ms: u64,
@@ -2005,11 +2338,61 @@ pub struct CliUpdate {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// grok clone (utility process)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// History shape requested by the client or produced by the daemon.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneHistoryMode {
+    Shallow,
+    Full,
+}
+
+/// Whether `grok clone` finished the mount.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneOutcome {
+    Success,
+    Failed,
+}
+
+/// Where a failed `grok clone` stopped.
+/// Closed set: no freeform strings.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneFailureStage {
+    Configuration,
+    Validation,
+    Preflight,
+    Daemon,
+}
+
+/// One `grok clone` attempt. Content-free: no URL, dest, store, or repo name.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct CloneEnded {
+    pub requested_history: CloneHistoryMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_history: Option<CloneHistoryMode>,
+    pub duration_ms: u64,
+    pub outcome: CloneOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_stage: Option<CloneFailureStage>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Event name bindings
 // ─────────────────────────────────────────────────────────────────────────────
 
 telemetry_event!(ManualAuth, "manual_auth");
+telemetry_event!(AuthLockWait, "auth_lock_wait");
+telemetry_event!(AuthLockTimeout, "auth_lock_timeout");
+telemetry_event!(
+    AuthLockReplacedOutFromUnder,
+    "auth_lock_replaced_out_from_under"
+);
 telemetry_event!(CliUpdate, "cli_update");
+telemetry_event!(CloneEnded, "clone_ended");
 
 telemetry_event!(Login, "login", external = crate::external::schema::map_auth);
 telemetry_event!(LoginPickerShown, "login_picker_shown");
@@ -2037,7 +2420,7 @@ telemetry_event!(
 telemetry_event!(SlashCommandUsed, "slash_command_used");
 telemetry_event!(PermissionPrompted, "permission_prompted");
 telemetry_event!(
-    PermissionDecisionPayload,
+    PermissionDecisionRecord,
     "permission_decision",
     external = crate::external::schema::map_tool_decision
 );
@@ -2061,6 +2444,13 @@ telemetry_event!(
     external = crate::external::schema::map_subagent_completed
 );
 telemetry_event!(SubagentLimitHit, "subagent_limit_hit");
+telemetry_event!(SubagentRateLimitWaited, "subagent_rate_limit_waited");
+telemetry_event!(
+    ActiveAgentMessageCompleted,
+    "active_agent_message_completed"
+);
+telemetry_event!(ActiveAgentMessageLimitHit, "active_agent_message_limit_hit");
+telemetry_event!(ActiveAgentMessageSettled, "active_agent_message_settled");
 telemetry_event!(WorkflowRunStarted, "workflow_run_started");
 telemetry_event!(WorkflowRunEnded, "workflow_run_ended");
 telemetry_event!(
@@ -2139,6 +2529,7 @@ telemetry_event!(MultiAgentDiscard, "multi_agent_discard");
 telemetry_event!(RepoChanges, "repo_changes");
 telemetry_event!(NonGitDecisionEvent, "non_git_decision");
 telemetry_event!(PromptLatency, "prompt_latency");
+telemetry_event!(CancellationCompleted, "cancellation_completed");
 telemetry_event!(HeapThresholdCrossed, "heap_threshold_crossed");
 telemetry_event!(ProcessResourceUsage, "process_resource_usage");
 telemetry_event!(ProcessResourceLimits, "process_resource_limits");
@@ -2148,6 +2539,7 @@ telemetry_event!(
     external = crate::external::schema::map_turn_completed
 );
 telemetry_event!(ShellTrueNoop, "shell_true_noop");
+telemetry_event!(ActionStationarityNudge, "action_stationarity_nudge");
 telemetry_event!(ActionStationarityStop, "action_stationarity_stop");
 telemetry_event!(
     ToolCallCompleted,
@@ -2159,6 +2551,11 @@ telemetry_event!(
     "model_response_received",
     external = crate::external::schema::map_api_request
 );
+telemetry_event!(
+    AssistantResponse,
+    "assistant_response",
+    external = crate::external::schema::map_assistant_response
+);
 telemetry_event!(MemoryFlushed, "memory_flushed");
 telemetry_event!(MediaGenerated, "media_generated");
 telemetry_event!(
@@ -2166,23 +2563,30 @@ telemetry_event!(
     "session_ended",
     external = crate::external::schema::map_session_end
 );
+telemetry_event!(SessionEndTimings, "session_end_timings");
 telemetry_event!(
     AgentConnect,
     "agent_connect",
     external = crate::external::schema::map_agent_connect
 );
 telemetry_event!(
-    StartupComplete,
-    "startup_complete",
-    external = crate::external::schema::map_startup_complete
+    StartupCompleted,
+    "startup_completed",
+    external = crate::external::schema::map_startup_completed
 );
 telemetry_event!(PagerSlashCommand, "pager_slash_command");
 telemetry_event!(PlanSubmit, "plan_submit");
+telemetry_event!(EventLoopStall, "event_loop_stall");
 telemetry_event!(SuperGrokUpsellShown, "supergrok_upsell_shown");
 telemetry_event!(SuperGrokUpsellClicked, "supergrok_upsell_clicked");
 telemetry_event!(AnnouncementCtaShown, "announcement_cta_shown");
 telemetry_event!(AnnouncementCtaClicked, "announcement_cta_clicked");
 telemetry_event!(CodingDataConsentSelected, "coding_data_consent_selected");
+telemetry_event!(FeedbackTraceCardShown, "feedback_trace_card_shown");
+telemetry_event!(
+    FeedbackTraceConsentSelected,
+    "feedback_trace_consent_selected"
+);
 telemetry_event!(TerminalTelemetry, "terminal_context");
 telemetry_event!(DisplayRefreshProbe, "display_refresh_probe");
 telemetry_event!(BackspaceNoEffect, "backspace_no_effect");
@@ -2204,6 +2608,8 @@ telemetry_event!(CreditLimitHit, "credit_limit_hit");
 telemetry_event!(CreditLimitUpsellShown, "credit_limit_upsell_shown");
 telemetry_event!(CreditLimitUpsellClicked, "credit_limit_upsell_clicked");
 telemetry_event!(SubscriptionActivated, "subscription_activated");
+telemetry_event!(StatusLineConfigured, "status_line_configured");
+telemetry_event!(StatusLineHealth, "status_line_health");
 telemetry_event!(
     ApiError,
     "api_error",
@@ -2223,10 +2629,18 @@ telemetry_event!(ExternalOtelExportHealth, "external_otel_export_health");
 
 // Session lifecycle (structs in session_metrics)
 telemetry_event!(crate::session_metrics::SessionStarted, "session_started");
+telemetry_event!(
+    crate::session_metrics::SessionContextSnapshot,
+    "session_context_snapshot"
+);
 telemetry_event!(crate::session_metrics::Turn, "turn");
 telemetry_event!(
     crate::session_metrics::TurnCompletedLifecycle,
     "turn_completed_lifecycle"
+);
+telemetry_event!(
+    crate::session_metrics::DoomLoopDetected,
+    "doom_loop_detected"
 );
 telemetry_event!(
     crate::session_metrics::DoomLoopRecovery,
@@ -2276,7 +2690,315 @@ telemetry_event!(
 
 #[cfg(test)]
 mod tests {
+    /// Reserved keys insert only-if-absent, so an event field that collides intentionally wins over the enrichment.
+    /// Walk every registered event's fields from source and pin the intentional shadows, so a new event cannot silently shadow a reserved key.
+    #[test]
+    fn event_fields_shadow_reserved_keys_only_on_the_allowlist() {
+        const SOURCES: &[&str] = &[
+            include_str!("mod.rs"),
+            include_str!("active_agent_message.rs"),
+            include_str!("permission_analytics.rs"),
+            include_str!("../session_metrics.rs"),
+            include_str!("../memory_telemetry.rs"),
+        ];
+
+        let mut registry: Vec<&str> = Vec::new();
+        for src in SOURCES {
+            for chunk in src.split("telemetry_event!(").skip(1) {
+                let path = chunk
+                    .trim_start()
+                    .split(',')
+                    .next()
+                    .unwrap_or_default()
+                    .trim();
+                let name = path.rsplit("::").next().unwrap_or(path);
+                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    registry.push(name);
+                }
+            }
+        }
+
+        let mut fields: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+        for src in SOURCES {
+            let mut lines = src.lines();
+            while let Some(line) = lines.next() {
+                let Some(decl) = line.trim_start().strip_prefix("pub struct ") else {
+                    continue;
+                };
+                let name = decl
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or_default();
+                let entry = fields.entry(name).or_default();
+                if !decl.contains('{') || decl.contains('}') {
+                    continue;
+                }
+                for body in lines.by_ref() {
+                    if body == "}" {
+                        break;
+                    }
+                    let b = body.trim_start();
+                    if b.starts_with("//") || b.starts_with('#') {
+                        continue;
+                    }
+                    let b = b.strip_prefix("pub ").unwrap_or(b);
+                    if let Some((ident, _)) = b.split_once(':')
+                        && !ident.is_empty()
+                        && ident
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    {
+                        entry.push(ident.to_string());
+                    }
+                }
+            }
+        }
+
+        let reserved: std::collections::BTreeSet<&str> =
+            crate::client::RESERVED_EVENT_KEYS.iter().copied().collect();
+        let mut shadows: std::collections::BTreeSet<(String, String)> = Default::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for event in registry {
+            assert!(seen.insert(event), "event {event} registered twice");
+            let event_fields = fields
+                .get(event)
+                .unwrap_or_else(|| panic!("registered event {event} has no parsed struct"));
+            for field in event_fields {
+                if reserved.contains(field.as_str()) {
+                    shadows.insert((event.to_string(), field.clone()));
+                }
+            }
+        }
+        assert!(
+            seen.len() > 100,
+            "the registry walk collapsed: {}",
+            seen.len()
+        );
+
+        const ALLOWED: &[(&str, &str)] = &[
+            ("DoomLoopDetected", "session_id"),
+            ("DoomLoopDetected", "turn_number"),
+            ("DoomLoopRecovery", "session_id"),
+            ("DoomLoopRecovery", "turn_number"),
+            ("MemoryFlushComplete", "session_id"),
+            ("MemoryFlushStart", "session_id"),
+            ("MemoryInjection", "session_id"),
+            ("MemoryReindex", "session_id"),
+            ("MemorySearch", "session_id"),
+            ("MemorySessionInit", "session_id"),
+            ("MemorySessionSummary", "session_id"),
+            ("MemoryWatcherSync", "session_id"),
+            ("ModelSwitched", "session_id"),
+            ("NonGitDecisionEvent", "session_id"),
+            ("ProcessResourceUsage", "footprint_bytes"),
+            ("ProcessResourceUsage", "rss_bytes"),
+            ("PromptSuggestion", "session_id"),
+            ("RolloutSurvey", "session_id"),
+            ("SessionHarness", "session_id"),
+            ("SessionLoad", "session_id"),
+            ("SessionNew", "session_id"),
+            ("SessionContextSnapshot", "session_id"),
+            ("SessionStarted", "session_id"),
+            ("TraceUploadAttempted", "session_id"),
+            ("TraceUploadAttempted", "turn_number"),
+            ("TraceUploadFailed", "session_id"),
+            ("TraceUploadFailed", "turn_number"),
+            ("TraceUploadSkipped", "session_id"),
+            ("TraceUploadSkipped", "turn_number"),
+            ("TraceUploadSucceeded", "session_id"),
+            ("TraceUploadSucceeded", "turn_number"),
+            ("Turn", "session_id"),
+            ("Turn", "turn_number"),
+            ("TurnCompletedLifecycle", "session_id"),
+            ("TurnCompletedLifecycle", "turn_number"),
+            ("UserFeedback", "session_id"),
+        ];
+        let allowed: std::collections::BTreeSet<(String, String)> = ALLOWED
+            .iter()
+            .map(|(s, f)| (s.to_string(), f.to_string()))
+            .collect();
+        assert_eq!(
+            shadows, allowed,
+            "reserved-key shadows changed; extend the allowlist only for intentional event-owned values"
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn clone_ended_is_content_free_and_omits_absent_fields() {
+        assert_eq!(CloneEnded::NAME, "clone_ended");
+        assert_eq!(
+            serde_json::to_value(CloneEnded {
+                requested_history: CloneHistoryMode::Shallow,
+                effective_history: Some(CloneHistoryMode::Shallow),
+                duration_ms: 42,
+                outcome: CloneOutcome::Success,
+                failure_stage: None,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "requested_history": "shallow",
+                "effective_history": "shallow",
+                "duration_ms": 42,
+                "outcome": "success",
+            })
+        );
+        let failed = serde_json::to_value(CloneEnded {
+            requested_history: CloneHistoryMode::Shallow,
+            effective_history: None,
+            duration_ms: 7,
+            outcome: CloneOutcome::Failed,
+            failure_stage: Some(CloneFailureStage::Preflight),
+        })
+        .unwrap();
+        assert_eq!(failed["failure_stage"], "preflight");
+        assert!(failed.get("effective_history").is_none());
+        let text = failed.to_string();
+        assert!(!text.contains("http"), "{text}");
+        assert!(!text.contains("path"), "{text}");
+        assert!(!text.contains("url"), "{text}");
+        assert!(!text.contains("repo"), "{text}");
+    }
+
+    #[test]
+    fn process_resource_usage_omits_allocated_bytes_when_unavailable() {
+        assert_eq!(
+            serde_json::to_value(ProcessResourceUsage {
+                trigger: ResourceReportTrigger::Periodic,
+                rss_bytes: None,
+                peak_rss_bytes: None,
+                footprint_bytes: None,
+                allocated_bytes: Some(4_096),
+                threads: None,
+                open_files: None,
+                resident_sessions: 2,
+                session_threads: 3,
+                idle: false,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "trigger": "periodic",
+                "allocated_bytes": 4_096,
+                "resident_sessions": 2,
+                "session_threads": 3,
+                "idle": false,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ProcessResourceUsage {
+                trigger: ResourceReportTrigger::Periodic,
+                rss_bytes: None,
+                peak_rss_bytes: None,
+                footprint_bytes: None,
+                allocated_bytes: None,
+                threads: None,
+                open_files: None,
+                resident_sessions: 2,
+                session_threads: 3,
+                idle: false,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "trigger": "periodic",
+                "resident_sessions": 2,
+                "session_threads": 3,
+                "idle": false,
+            })
+        );
+    }
+
+    #[test]
+    fn tool_call_completed_omits_tool_result_size_bytes_when_absent() {
+        assert_eq!(
+            serde_json::to_value(ToolCallCompleted {
+                tool_name: "bash".into(),
+                outcome: xai_grok_session_events::types::ToolOutcome::Success,
+                hook_rewrote: false,
+                duration_ms: 7,
+                tool_result_size_bytes: Some(2_048),
+                file_path: None,
+                parameters: None,
+                tool_use_id: None,
+                tool_output: None,
+                error_message: None,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "tool_name": "bash",
+                "outcome": "success",
+                "hook_rewrote": false,
+                "duration_ms": 7,
+                "tool_result_size_bytes": 2_048,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ToolCallCompleted {
+                tool_name: "bash".into(),
+                outcome: xai_grok_session_events::types::ToolOutcome::Success,
+                hook_rewrote: false,
+                duration_ms: 7,
+                tool_result_size_bytes: None,
+                file_path: None,
+                parameters: None,
+                tool_use_id: None,
+                tool_output: None,
+                error_message: None,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "tool_name": "bash",
+                "outcome": "success",
+                "hook_rewrote": false,
+                "duration_ms": 7,
+            })
+        );
+    }
+
+    #[test]
+    fn auth_lock_wait_event_carries_wait_and_budget() {
+        assert_eq!(
+            serde_json::to_value(AuthLockWait {
+                wait_ms: 4321,
+                budget_ms: 25_000,
+            })
+            .unwrap(),
+            serde_json::json!({ "wait_ms": 4321, "budget_ms": 25_000 })
+        );
+    }
+
+    #[test]
+    fn auth_lock_timeout_event_omits_an_unknown_holder_state() {
+        assert_eq!(
+            serde_json::to_value(AuthLockTimeout {
+                budget_ms: 25_000,
+                holder_state: Some("stuck_live"),
+            })
+            .unwrap(),
+            serde_json::json!({ "budget_ms": 25_000, "holder_state": "stuck_live" })
+        );
+        assert_eq!(
+            serde_json::to_value(AuthLockTimeout {
+                budget_ms: 10_000,
+                holder_state: None,
+            })
+            .unwrap(),
+            serde_json::json!({ "budget_ms": 10_000 })
+        );
+    }
+
+    #[test]
+    fn auth_lock_replaced_event_omits_unknown_holder_fields() {
+        assert_eq!(
+            serde_json::to_value(AuthLockReplacedOutFromUnder {
+                holder_pid: Some(42),
+                holder_state: Some("alive"),
+                holder_age_secs: None,
+            })
+            .unwrap(),
+            serde_json::json!({ "holder_pid": 42, "holder_state": "alive" })
+        );
+    }
 
     fn terminal_telemetry_fixture() -> TerminalTelemetry {
         TerminalTelemetry {
@@ -2373,8 +3095,8 @@ mod tests {
             })
         );
 
-        // `principal` is omitted (not null) when unknown. `LegacySession` is a
-        // reachable fixture (API-key sessions never emit this event).
+        // `principal` is omitted (not null) when unknown
+        // `LegacySession` is a reachable fixture (API-key sessions never emit this event)
         let no_principal = serde_json::to_value(ManualAuth {
             reason: ManualAuthReason::NoRefreshAuthority,
             trigger: ManualAuthSurface::Relay,
@@ -2511,6 +3233,172 @@ mod tests {
                 "attempt": 2,
                 "context_window": 128_000,
                 "compaction_id": "cid-2",
+            })
+        );
+    }
+
+    #[test]
+    fn compaction_triggered_name_and_shape() {
+        assert_eq!(CompactionTriggered::NAME, "compaction_triggered");
+        let event = serde_json::to_value(CompactionTriggered {
+            trigger: CompactionTrigger::Auto,
+            tokens_used: 100_000,
+            context_window: 128_000,
+            percentage: 78,
+            model_id: "grok-4".into(),
+            user_context_provided: false,
+            compaction_id: "cid-1".into(),
+            compaction_mode: CompactionModeLabel::Segments,
+            two_pass_enabled: true,
+            is_subagent: false,
+        })
+        .unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "trigger": "auto",
+                "tokens_used": 100_000,
+                "context_window": 128_000,
+                "percentage": 78,
+                "model_id": "grok-4",
+                "user_context_provided": false,
+                "compaction_id": "cid-1",
+                "compaction_mode": "segments",
+                "two_pass_enabled": true,
+                "is_subagent": false,
+            })
+        );
+
+        let disarmed = serde_json::to_value(CompactionTriggered {
+            trigger: CompactionTrigger::Manual,
+            tokens_used: 10_000,
+            context_window: 128_000,
+            percentage: 8,
+            model_id: "grok-4".into(),
+            user_context_provided: false,
+            compaction_id: "cid-2".into(),
+            compaction_mode: CompactionModeLabel::Summary,
+            two_pass_enabled: false,
+            is_subagent: false,
+        })
+        .unwrap();
+        assert_eq!(
+            disarmed,
+            serde_json::json!({
+                "trigger": "manual",
+                "tokens_used": 10_000,
+                "context_window": 128_000,
+                "percentage": 8,
+                "model_id": "grok-4",
+                "user_context_provided": false,
+                "compaction_id": "cid-2",
+                "compaction_mode": "summary",
+                "two_pass_enabled": false,
+                "is_subagent": false,
+            })
+        );
+    }
+
+    #[test]
+    fn compaction_completed_name_and_shape() {
+        assert_eq!(CompactionCompleted::NAME, "compaction_completed");
+        let with_model = serde_json::to_value(CompactionCompleted {
+            duration_ms: 63_000,
+            tokens_before: 399_000,
+            tokens_after: 15_000,
+            model_id: Some("grok-4".into()),
+            compaction_id: "cid-1".into(),
+            compaction_mode: CompactionModeLabel::Summary,
+            two_pass: TwoPassOutcome::TwoPass,
+            segments_queued: 0,
+            degenerate_retries: 1,
+            input_overflow_retries: 2,
+            is_subagent: false,
+            model_wait_ms: None,
+            pre_compaction_ms: None,
+            post_compaction_ms: None,
+        })
+        .unwrap();
+        assert_eq!(
+            with_model,
+            serde_json::json!({
+                "duration_ms": 63_000,
+                "tokens_before": 399_000,
+                "tokens_after": 15_000,
+                "model_id": "grok-4",
+                "compaction_id": "cid-1",
+                "compaction_mode": "summary",
+                "two_pass": "two_pass",
+                "segments_queued": 0,
+                "degenerate_retries": 1,
+                "input_overflow_retries": 2,
+                "is_subagent": false,
+            })
+        );
+
+        let no_model = serde_json::to_value(CompactionCompleted {
+            duration_ms: 1,
+            tokens_before: 1,
+            tokens_after: 1,
+            model_id: None,
+            compaction_id: "cid-2".into(),
+            compaction_mode: CompactionModeLabel::Transcript,
+            two_pass: TwoPassOutcome::Disabled,
+            segments_queued: 0,
+            degenerate_retries: 0,
+            input_overflow_retries: 0,
+            is_subagent: true,
+            model_wait_ms: None,
+            pre_compaction_ms: None,
+            post_compaction_ms: None,
+        })
+        .unwrap();
+        assert_eq!(
+            no_model,
+            serde_json::json!({
+                "duration_ms": 1,
+                "tokens_before": 1,
+                "tokens_after": 1,
+                "compaction_id": "cid-2",
+                "compaction_mode": "transcript",
+                "two_pass": "disabled",
+                "segments_queued": 0,
+                "degenerate_retries": 0,
+                "input_overflow_retries": 0,
+                "is_subagent": true,
+            })
+        );
+
+        let single_pass = serde_json::to_value(CompactionCompleted {
+            duration_ms: 2,
+            tokens_before: 2,
+            tokens_after: 2,
+            model_id: None,
+            compaction_id: "cid-3".into(),
+            compaction_mode: CompactionModeLabel::Segments,
+            two_pass: TwoPassOutcome::SinglePass,
+            segments_queued: 1,
+            degenerate_retries: 0,
+            input_overflow_retries: 0,
+            is_subagent: false,
+            model_wait_ms: None,
+            pre_compaction_ms: None,
+            post_compaction_ms: None,
+        })
+        .unwrap();
+        assert_eq!(
+            single_pass,
+            serde_json::json!({
+                "duration_ms": 2,
+                "tokens_before": 2,
+                "tokens_after": 2,
+                "compaction_id": "cid-3",
+                "compaction_mode": "segments",
+                "two_pass": "single_pass",
+                "segments_queued": 1,
+                "degenerate_retries": 0,
+                "input_overflow_retries": 0,
+                "is_subagent": false,
             })
         );
     }
@@ -2693,7 +3581,7 @@ mod tests {
             assert_eq!(t.as_str().parse::<CliUpdateTrigger>().unwrap(), t);
         }
         assert!("bogus".parse::<CliUpdateTrigger>().is_err());
-        // Wire values and from_installer_str round-trip — one mapping.
+        // Wire values and from_installer_str round-trip: one mapping
         for (installer, wire) in [
             (CliUpdateInstaller::Npm, "npm"),
             (CliUpdateInstaller::GhRelease, "gh-release"),

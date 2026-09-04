@@ -28,6 +28,7 @@ pub(crate) mod cancel;
 pub mod connection;
 pub(crate) mod connection_borrow;
 pub mod demux;
+pub mod discovery;
 pub(crate) mod donate_pump;
 pub mod error;
 pub mod handshake;
@@ -46,7 +47,7 @@ pub mod trace_donate;
 pub mod oidc_provider;
 
 pub use auth::{AuthCredential, AuthIdentity, AuthProvider, PrincipalKey, SharedAuthProvider};
-pub use connection::{ConnKey, HubConnection, ReconnectEvent};
+pub use connection::{CLOSE_CODE_SANDBOX_TERMINATED, ConnKey, HubConnection, ReconnectEvent};
 pub use error::ClientError;
 pub use harness::{
     CancelOnDrop, LocalRegistry, ModelOutputExtractor, SessionBindReport, ToolHarness,
@@ -62,10 +63,14 @@ pub use oidc_provider::{
 };
 pub use pool::HubConnectionPool;
 pub use server::{
-    ResolvedSessionHandlers, SessionHandlerResolver, SystemNotifyAck, ToolServer,
-    ToolServerBuilder, ToolServerHandler, WeakToolServer,
+    ResolvedSessionHandlers, SessionHandlerResolver, SessionUnboundCallback, SystemNotifyAck,
+    ToolServer, ToolServerBuilder, ToolServerHandler, WeakToolServer,
 };
 pub use trace_donate::{HubDonatingReporter, TraceDonationPump};
+pub use xai_computer_hub_core::{
+    GROK_BOT_TOOL_DESCRIPTIONS, GROK_BOT_TOOL_IDS, grok_bot_tool_arguments_schema,
+    grok_bot_tool_description, is_grok_bot_tool,
+};
 // Re-exported so consumers that depend only on the SDK can recognize the
 // server's `workspace_unavailable` error without also pulling in the core crate.
 pub use xai_computer_hub_core::is_workspace_unavailable;

@@ -67,12 +67,22 @@ path = "tests/env_op_compile.rs"
 name = "pty-scenario"
 path = "src/bin/pty_scenario.rs"
 
+# Fixture for tests/orphan_reap.rs: holds a PtyController child and blocks so
+# the test can kill it ungracefully and assert the child does not survive.
+[[bin]]
+name = "pty_orphan_holder"
+path = "src/bin/pty_orphan_holder.rs"
+
 # scroll-matrix — scroll validation matrix sweep. The curated tier also runs
 # in CI (tests/scroll_matrix_curated.rs); this binary is the local full-sweep
 # and single-cell-rerun entry point.
 [[bin]]
 name = "scroll-matrix"
 path = "src/bin/scroll_matrix.rs"
+
+[[bin]]
+name = "startup-tui-probe"
+path = "src/bin/startup_tui_probe.rs"
 
 # pty_bench scenario runner — produces a standalone binary the CI pipeline
 # pre-compiles and executes directly against a release pager artifact.

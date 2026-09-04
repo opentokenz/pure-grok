@@ -1,5 +1,31 @@
 use super::*;
 use xai_grok_sampling_types::SyntheticReason;
+use xai_grok_sampling_types::{BackendToolCallItem, BackendToolKind, rs};
+#[test]
+fn summarization_prep_drops_backend_tool_calls() {
+    let items = vec![
+        ConversationItem::user("hi"),
+        ConversationItem::BackendToolCall(BackendToolCallItem {
+            kind: BackendToolKind::WebSearch(rs::WebSearchToolCall {
+                id: "ws_res-uuid_call-uuid-1".to_string(),
+                status: rs::WebSearchToolCallStatus::Completed,
+                action: rs::WebSearchToolCallAction::Search(rs::WebSearchActionSearch {
+                    query: "weather".to_string(),
+                    sources: None,
+                }),
+            }),
+        }),
+        ConversationItem::assistant("done"),
+    ];
+    let prepared = prepare_conversation_for_summarization(items);
+    assert!(
+        !prepared
+            .iter()
+            .any(|i| matches!(i, ConversationItem::BackendToolCall(_))),
+        "provider-minted native items must not reach the summarizer request"
+    );
+    assert_eq!(prepared.len(), 2);
+}
 #[test]
 fn compaction_attempt_serde_roundtrip_and_skips_none() {
     let attempt = CompactionAttempt {
@@ -101,21 +127,6 @@ fn test_extract_user_query_ignores_nested_rules_query_before_outer_query() {
          </always_applied_workspace_rules></rules>\n\n\
          <user_query>real request</user_query>";
     assert_eq!(extract_user_query(input), "real request");
-}
-#[test]
-fn test_strip_fork_context_tag() {
-    let input = "<fork-context>\nYou inherited context.\n</fork-context>\n\nreal content";
-    assert_eq!(extract_user_query(input), "real content");
-}
-#[test]
-fn test_strip_system_reminder_tag() {
-    let input = "<system-reminder>\nFollow these instructions.\n</system-reminder>\n\nreal content";
-    assert_eq!(extract_user_query(input), "real content");
-}
-#[test]
-fn test_strip_agent_memory_tag() {
-    let input = "<agent-memory>\nPrevious context.\n</agent-memory>\n\nreal content";
-    assert_eq!(extract_user_query(input), "real content");
 }
 #[test]
 fn test_strip_system_underscore_reminder_tag() {
@@ -940,6 +951,47 @@ async fn build_stores_and_for_compaction_preserves_todos() {
         "todos must survive for_compaction() like other live state"
     );
     assert_eq!(compacted.todos[1].content, "do the other thing");
+}
+#[tokio::test]
+async fn build_stores_and_for_compaction_preserves_loops_and_workflows() {
+    let conversation = vec![
+        ConversationItem::user("<user_query>\ntask\n</user_query>"),
+        ConversationItem::assistant("working"),
+    ];
+    let ctx = CompactionStateContext::build(
+        &conversation,
+        CompactionInputs {
+            scheduled_loops: vec![ScheduledLoopSummary {
+                task_id: "loop-1".into(),
+                interval: "every 5 minutes".into(),
+                next_fire_at: "2026-08-29T00:00:00Z".into(),
+                prompt: "check CI".into(),
+                recurring: true,
+                durable: false,
+                foreground: false,
+            }],
+            workflows: vec![WorkflowRunSummary {
+                name: "review-changes".into(),
+                run_id: "wf-1".into(),
+                status: "active".into(),
+                objective: "review".into(),
+                current_phase: Some("Plan".into()),
+                agents_used: 1,
+                agent_budget: Some(8),
+                elapsed_ms: 4_000,
+            }],
+            workflow_tool_name: Some("workflow".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(ctx.scheduled_loops[0].task_id, "loop-1");
+    assert_eq!(ctx.workflows[0].run_id, "wf-1");
+    let compacted = ctx.for_compaction();
+    assert!(compacted.recent_messages.is_empty());
+    assert_eq!(compacted.scheduled_loops.len(), 1);
+    assert_eq!(compacted.workflows[0].name, "review-changes");
+    assert_eq!(compacted.workflow_tool_name.as_deref(), Some("workflow"));
 }
 /// The compaction view drops the working transcript (`recent_messages`)
 /// while preserving the last real user query and all other live state.
@@ -2098,6 +2150,9 @@ fn generation_zero_compaction_keeps_legacy_project_instructions() {
         running_subagents: vec![],
         connected_mcp_servers: vec![],
         todos: vec![],
+        scheduled_loops: vec![],
+        workflows: vec![],
+        workflow_tool_name: None,
     };
     let compacted = build_compacted_history(CompactedHistoryInput {
         system_message: ConversationItem::system("sys"),
@@ -2125,6 +2180,9 @@ fn relocated_compaction_uses_destination_project_instructions() {
         running_subagents: vec![],
         connected_mcp_servers: vec![],
         todos: vec![],
+        scheduled_loops: vec![],
+        workflows: vec![],
+        workflow_tool_name: None,
     };
     let compacted = build_compacted_history(CompactedHistoryInput {
         system_message: ConversationItem::system("sys"),
@@ -2152,6 +2210,9 @@ fn relocated_compaction_does_not_restore_source_instructions_when_destination_ha
         running_subagents: vec![],
         connected_mcp_servers: vec![],
         todos: vec![],
+        scheduled_loops: vec![],
+        workflows: vec![],
+        workflow_tool_name: None,
     };
     let compacted = build_compacted_history(CompactedHistoryInput {
         system_message: ConversationItem::system("sys"),
@@ -2182,6 +2243,9 @@ fn build_compacted_history_tags_agents_md_with_project_instructions() {
         running_subagents: vec![],
         connected_mcp_servers: vec![],
         todos: vec![],
+        scheduled_loops: vec![],
+        workflows: vec![],
+        workflow_tool_name: None,
     };
     let reminder = "some AGENTS.md body".to_string();
     let compacted = build_compacted_history(CompactedHistoryInput {
@@ -2226,6 +2290,9 @@ fn build_compacted_history_omits_agents_md_when_none() {
         running_subagents: vec![],
         connected_mcp_servers: vec![],
         todos: vec![],
+        scheduled_loops: vec![],
+        workflows: vec![],
+        workflow_tool_name: None,
     };
     let compacted = build_compacted_history(CompactedHistoryInput {
         system_message: ConversationItem::system("sys"),

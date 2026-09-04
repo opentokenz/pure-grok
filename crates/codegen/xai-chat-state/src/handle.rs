@@ -21,6 +21,18 @@ pub struct ChatStateHandle {
     cmd_tx: mpsc::UnboundedSender<ChatStateCommand>,
 }
 
+/// The chat-state actor can no longer accept commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatStateMailboxClosed;
+
+impl std::fmt::Display for ChatStateMailboxClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("chat-state actor mailbox is closed")
+    }
+}
+
+impl std::error::Error for ChatStateMailboxClosed {}
+
 impl ChatStateHandle {
     /// Create a new handle with the given command sender.
     pub(crate) fn new(cmd_tx: mpsc::UnboundedSender<ChatStateCommand>) -> Self {
@@ -39,6 +51,27 @@ impl ChatStateHandle {
     /// Push a user message into the conversation.
     pub fn push_user_message(&self, item: ConversationItem) {
         let _ = self.cmd_tx.send(ChatStateCommand::PushUserMessage { item });
+    }
+
+    /// Enqueue an ordered batch of user messages as one actor command.
+    pub fn try_push_user_messages_batch(
+        &self,
+        items: Vec<ConversationItem>,
+    ) -> Result<(), ChatStateMailboxClosed> {
+        self.cmd_tx
+            .send(ChatStateCommand::PushUserMessagesBatch { items })
+            .map_err(|_| ChatStateMailboxClosed)
+    }
+
+    /// Enqueue an ordered batch and await acknowledgement after every item is processed.
+    pub async fn push_user_messages_batch_and_ack(
+        &self,
+        items: Vec<ConversationItem>,
+    ) -> Option<()> {
+        self.query("PushUserMessagesBatchAndAck", |reply| {
+            ChatStateCommand::PushUserMessagesBatchAndAck { items, reply }
+        })
+        .await
     }
 
     /// Push a user message and await acknowledgement that the chat-state actor
@@ -94,6 +127,18 @@ impl ChatStateHandle {
     /// Record a tool result.
     pub fn push_tool_result(&self, item: ConversationItem) {
         let _ = self.cmd_tx.send(ChatStateCommand::PushToolResult { item });
+    }
+
+    /// Persist model output already included in the provider's usage total.
+    pub fn push_model_output(&self, item: ConversationItem) {
+        let _ = self.cmd_tx.send(ChatStateCommand::PushModelOutput { item });
+    }
+
+    /// Persist model output whose provider response omitted usage.
+    pub fn push_unreported_model_output(&self, item: ConversationItem) {
+        let _ = self
+            .cmd_tx
+            .send(ChatStateCommand::PushUnreportedModelOutput { item });
     }
 
     /// Record accumulated token usage.
@@ -156,6 +201,23 @@ impl ChatStateHandle {
         })
         .await
         .is_some()
+    }
+
+    /// Send-only [`Self::mark_usage_incomplete`]: enqueues synchronously so
+    /// the mark orders ahead of any later command or query on this handle
+    /// (e.g. the turn's billing epilogue), without awaiting the actor.
+    pub fn mark_usage_incomplete_nowait(&self, prompt: bool, session: bool) {
+        let (reply, _rx) = oneshot::channel();
+        let cmd = ChatStateCommand::MarkUsageIncomplete {
+            prompt,
+            session,
+            reply,
+        };
+        if self.cmd_tx.send(cmd).is_err() {
+            // Benign during session teardown when a turn epilogue races the
+            // actor's shutdown; the session's usage ledger is final by then.
+            tracing::warn!("ChatStateActor dead: MarkUsageIncomplete dropped");
+        }
     }
 
     /// Increment prompt index (called at start of each user turn).
@@ -318,6 +380,15 @@ impl ChatStateHandle {
             .send(ChatStateCommand::RepairDanglingAfterHarnessHalt { class });
     }
 
+    /// Drop a trailing continue reminder whose continuation will never
+    /// sample. Fire-and-forget; mailbox order puts the pop before any
+    /// subsequent command's view of history.
+    pub fn pop_stranded_continue_reminder(&self) {
+        let _ = self
+            .cmd_tx
+            .send(ChatStateCommand::PopStrandedContinueReminder);
+    }
+
     // ═══ Async queries (via oneshot) ═══
 
     /// Send a query to the actor and await the reply.
@@ -441,11 +512,17 @@ impl ChatStateHandle {
     /// `total_tokens` plus bytes/4 estimate of tool results pushed since the
     /// last model response. Used by `check_preflight_overflow`.
     pub async fn get_estimated_total_tokens(&self) -> u64 {
+        self.try_get_estimated_total_tokens().await.unwrap_or(0)
+    }
+
+    /// The same count, distinguishing "nothing yet" from "the actor did not
+    /// answer": a caller that reports occupancy cannot treat an unreadable
+    /// actor as an empty context.
+    pub async fn try_get_estimated_total_tokens(&self) -> Option<u64> {
         self.query("GetEstimatedTotalTokens", |reply| {
             ChatStateCommand::GetEstimatedTotalTokens { reply }
         })
         .await
-        .unwrap_or(0)
     }
 
     /// Bytes/4 estimate of all non-system conversation items.
@@ -594,6 +671,20 @@ impl ChatStateHandle {
         .flatten()
     }
 
+    /// Joins trailing assistant segments: the seek for the last assistant
+    /// text walks past mid-turn synthetics (old-query semantics); the join
+    /// then crosses only `SyntheticReason::LengthContinue` user items and
+    /// `Reasoning` — anything else bounds it. `None` when no trailing text
+    /// or the actor is dead; equals [`Self::get_last_assistant_text`] for a
+    /// normal turn.
+    pub async fn get_trailing_assistant_report(&self) -> Option<String> {
+        self.query("GetTrailingAssistantReport", |reply| {
+            ChatStateCommand::GetTrailingAssistantReport { reply }
+        })
+        .await
+        .flatten()
+    }
+
     /// Get the current turn's last assistant message text, or `None` when the
     /// turn produced none (or the actor is dead). Turn-scoped, unlike
     /// [`get_last_assistant_text`], and cheaper than [`get_conversation`].
@@ -603,6 +694,19 @@ impl ChatStateHandle {
     pub async fn get_last_assistant_text_in_turn(&self) -> Option<String> {
         self.query("GetLastAssistantTextInTurn", |reply| {
             ChatStateCommand::GetLastAssistantTextInTurn { reply }
+        })
+        .await
+        .flatten()
+    }
+
+    /// Concatenate every non-empty assistant message in the current turn
+    /// (`"\n"`-joined), or `None` when the turn produced none (or the actor is
+    /// dead). Same turn boundary as [`get_last_assistant_text_in_turn`].
+    ///
+    /// [`get_last_assistant_text_in_turn`]: Self::get_last_assistant_text_in_turn
+    pub async fn get_assistant_text_in_turn(&self) -> Option<String> {
+        self.query("GetAssistantTextInTurn", |reply| {
+            ChatStateCommand::GetAssistantTextInTurn { reply }
         })
         .await
         .flatten()
@@ -669,25 +773,5 @@ impl ChatStateHandle {
         })
         .await
         .flatten()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn noop_handle_does_not_panic() {
-        let handle = ChatStateHandle::noop();
-        handle.push_user_message(ConversationItem::user("test"));
-        handle.flush();
-        drop(handle);
-    }
-
-    #[test]
-    fn handle_is_clone() {
-        let handle = ChatStateHandle::noop();
-        let clone = handle.clone();
-        clone.push_user_message(ConversationItem::user("from clone"));
     }
 }

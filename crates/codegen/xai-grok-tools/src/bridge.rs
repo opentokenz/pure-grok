@@ -117,6 +117,11 @@ impl ToolBridge {
             .and_then(|r| r.tool_for_kind(kind).map(str::to_string))
     }
 
+    /// Resolve a canonical registry ID to its enabled client-facing name.
+    pub fn tool_for_registry_id(&self, registry_id: &str) -> Option<String> {
+        self.registry.tool_name_for_registry_id(registry_id)
+    }
+
     /// [`ToolKind`] for a registered tool by client-facing name, or
     /// `None` for unknown names. Sync — uses the registry's
     /// `RwLock::read`.
@@ -487,6 +492,21 @@ impl ToolBridge {
         }
     }
 
+    /// Move all running foreground commands to background instead of killing them, optionally scoped to `owner_session_id`.
+    /// Used on a mid-turn redirect (send-now) so an in-flight command is never SIGKILLed.
+    pub async fn background_foreground_commands(
+        &self,
+        owner_session_id: Option<&str>,
+    ) -> Vec<crate::computer::types::BackgroundedForeground> {
+        if let Some(terminal) = &self.terminal {
+            terminal
+                .background_foreground_commands(owner_session_id)
+                .await
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Kill all running background tasks.
     pub async fn kill_all_background_tasks(&self) {
         if let Some(terminal) = &self.terminal {
@@ -543,6 +563,14 @@ impl ToolBridge {
     /// Used by the host session to inject `ToolIndex` for search_tool.
     pub async fn update_resource<T: Send + Sync + 'static>(&self, resource: T) {
         let _ = self.registry.update_resource(resource).await;
+    }
+
+    /// See [`FinalizedToolset::update_resources_with`].
+    pub async fn update_resources_with(
+        &self,
+        seed: impl FnOnce(&mut crate::types::resources::Resources),
+    ) {
+        self.registry.update_resources_with(seed).await;
     }
 
     /// Kill a background task, recording who initiated the kill.

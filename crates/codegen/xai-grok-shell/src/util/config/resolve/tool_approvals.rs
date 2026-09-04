@@ -4,13 +4,15 @@ use toml::Value as TomlValue;
 /// Env override for the **remember tool approvals** permission-panel gate.
 pub(crate) const ENV_REMEMBER_TOOL_APPROVALS: &str = "GROK_REMEMBER_TOOL_APPROVALS";
 
-/// Extract the user knob `[ui] remember_tool_approvals` from one TOML layer.
+/// Shared with the pager settings modal so the displayed default cannot drift from the resolver.
+pub const DEFAULT_REMEMBER_TOOL_APPROVALS: bool = true;
+
 fn remember_tool_approvals_from_toml(v: Option<&TomlValue>) -> Option<bool> {
     v?.get("ui")?.get("remember_tool_approvals")?.as_bool()
 }
 
-/// Precedence core shared by the typed resolver and the disk reader so they
-/// can't drift: requirement > env > config > managed > remote > default `false`.
+/// Precedence core shared by the typed resolver and the disk reader so they can't drift.
+/// Order: requirement > env > config > managed > remote > default [`DEFAULT_REMEMBER_TOOL_APPROVALS`] (`true`).
 fn resolve_remember_tool_approvals_layers(
     requirement: Option<bool>,
     config: Option<bool>,
@@ -23,12 +25,13 @@ fn resolve_remember_tool_approvals_layers(
         .config(config)
         .managed(managed)
         .feature_flag(feature_flag)
+        .default(DEFAULT_REMEMBER_TOOL_APPROVALS)
         .resolve()
 }
 
-/// Resolve whether the granular per-tool "Always allow …" prompt options are
-/// shown. Precedence: requirements > env (`GROK_REMEMBER_TOOL_APPROVALS`) >
-/// `[ui].remember_tool_approvals` > managed > remote settings > default `false`.
+/// Resolve whether the granular per-tool "Always allow …" prompt options are shown.
+/// Precedence: requirements > env (`GROK_REMEMBER_TOOL_APPROVALS`) > `[ui].remember_tool_approvals` > managed > remote settings.
+/// Defaults to `true` ([`DEFAULT_REMEMBER_TOOL_APPROVALS`]).
 pub fn resolve_remember_tool_approvals(
     requirements: Option<&TomlValue>,
     user: Option<&TomlValue>,
@@ -43,14 +46,12 @@ pub fn resolve_remember_tool_approvals(
     )
 }
 
-/// Process-global cache of the remote tier, read by
-/// [`remember_tool_approvals_from_disk`] at spawn (no live `RemoteSettings`
-/// there). Fail-safe to `None` on lock poisoning.
+/// Process-global cache of the remote tier, read by [`remember_tool_approvals_from_disk`] at spawn (no live `RemoteSettings` there).
+/// Fail-safe to `None` on lock poisoning.
 static REMOTE_REMEMBER_TOOL_APPROVALS: std::sync::RwLock<Option<bool>> =
     std::sync::RwLock::new(None);
 
-/// Record the remote settings value; called when the agent applies `RemoteSettings`
-/// (`agent::init` at startup, `MvpAgent` on refresh).
+/// Record the remote settings value; called when the agent applies `RemoteSettings` (`agent::init` at startup, `MvpAgent` on refresh).
 pub(crate) fn cache_remote_remember_tool_approvals(value: Option<bool>) {
     if let Ok(mut guard) = REMOTE_REMEMBER_TOOL_APPROVALS.write() {
         *guard = value;
@@ -86,7 +87,7 @@ fn remember_tool_approvals_from_layers(
     .value
 }
 
-/// Disk form of the gate (overlay-free). Defaults `false`.
+/// Disk form of the gate (overlay-free). Defaults `true` ([`DEFAULT_REMEMBER_TOOL_APPROVALS`]).
 pub(crate) fn remember_tool_approvals_from_disk() -> bool {
     let requirements = crate::config::load_merged_requirements();
     let layers = match crate::config::ConfigLayers::load() {
@@ -108,9 +109,8 @@ mod remember_tool_approvals_gate_tests {
     use super::*;
     use crate::agent::config::ConfigSource;
 
-    // `GROK_REMEMBER_TOOL_APPROVALS` is process-global; serialize and force it
-    // unset at the top of each test so a developer's shell value can't make
-    // these flaky.
+    // `GROK_REMEMBER_TOOL_APPROVALS` is process-global
+    // Serialize and force it unset at the top of each test so a developer's shell value can't make these flaky
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         let g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -130,33 +130,43 @@ mod remember_tool_approvals_gate_tests {
     }
 
     #[test]
-    fn defaults_off_when_nothing_set() {
+    fn defaults_on_when_nothing_set() {
         let _g = guard();
         let r = resolve_remember_tool_approvals(None, None, None, None);
-        assert!(!r.value, "gate must default OFF");
+        assert!(r.value, "gate must default ON");
         assert_eq!(r.source, ConfigSource::Default);
     }
 
     #[test]
-    fn each_layer_can_turn_it_on() {
+    fn each_layer_can_turn_it_off() {
         let _g = guard();
-        let on = toml_ui(true);
+        let off = toml_ui(false);
         // requirement
-        let r = resolve_remember_tool_approvals(Some(&on), None, None, None);
-        assert!(r.value);
+        let r = resolve_remember_tool_approvals(Some(&off), None, None, None);
+        assert!(!r.value);
         assert_eq!(r.source, ConfigSource::Requirement);
         // config (user)
+        let r = resolve_remember_tool_approvals(None, Some(&off), None, None);
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::Config);
+        // managed
+        let r = resolve_remember_tool_approvals(None, None, Some(&off), None);
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::ManagedConfig);
+        // remote settings
+        let r = resolve_remember_tool_approvals(None, None, None, Some(&remote(Some(false))));
+        assert!(!r.value);
+        assert_eq!(r.source, ConfigSource::Remote);
+    }
+
+    #[test]
+    fn explicit_layer_reports_its_source() {
+        let _g = guard();
+        let on = toml_ui(true);
+        // An explicit `true` matches the default but must still resolve with the layer's provenance, not `Default`
         let r = resolve_remember_tool_approvals(None, Some(&on), None, None);
         assert!(r.value);
         assert_eq!(r.source, ConfigSource::Config);
-        // managed
-        let r = resolve_remember_tool_approvals(None, None, Some(&on), None);
-        assert!(r.value);
-        assert_eq!(r.source, ConfigSource::ManagedConfig);
-        // remote settings
-        let r = resolve_remember_tool_approvals(None, None, None, Some(&remote(Some(true))));
-        assert!(r.value);
-        assert_eq!(r.source, ConfigSource::Remote);
     }
 
     #[test]
@@ -165,8 +175,9 @@ mod remember_tool_approvals_gate_tests {
         let r = resolve_remember_tool_approvals(None, None, None, Some(&remote(Some(false))));
         assert!(!r.value);
         assert_eq!(r.source, ConfigSource::Remote);
+        // An absent remote tier falls through to the ON default.
         let r = resolve_remember_tool_approvals(None, None, None, Some(&remote(None)));
-        assert!(!r.value);
+        assert!(r.value);
         assert_eq!(r.source, ConfigSource::Default);
     }
 

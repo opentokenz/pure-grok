@@ -53,25 +53,34 @@ fn registered_settings() {
             ("voice_mode", ("GROK_VOICE_MODE", true)),
             ("write_file", ("GROK_WRITE_FILE", true)),
             ("feedback", ("GROK_FEEDBACK_ENABLED", true)),
+            ("feedback_trace_card", ("GROK_FEEDBACK_TRACE_CARD", false)),
             ("turn_summary", ("GROK_TURN_SUMMARY", true)),
             ("cancel_rewind", ("GROK_CANCEL_REWIND", true)),
             (
                 "compaction_verbatim_input",
                 ("GROK_COMPACTION_VERBATIM_INPUT", true),
             ),
-            ("two_pass_compaction", ("GROK_TWO_PASS_COMPACTION", false)),
+            ("two_pass_compaction", ("GROK_TWO_PASS_COMPACTION", true)),
             ("backend_tools", ("GROK_BACKEND_SEARCH", true)),
             ("auto_wake", ("GROK_AUTO_WAKE", true)),
             (
                 "subagent_worktree_snapshot",
                 ("GROK_SUBAGENT_WORKTREE_SNAPSHOT", false),
             ),
+            (
+                "active_agent_messages",
+                ("GROK_ACTIVE_AGENT_MESSAGES", false),
+            ),
+            (
+                "repo_status_in_system_prompt",
+                ("GROK_REPO_STATUS_IN_SYSTEM_PROMPT", true),
+            ),
+            ("dock", ("GROK_DOCK", false)),
         ]),
     );
 }
 
-/// A row wired to a neighbour's field type-checks, so each case sets one field
-/// and a wrong projection reads nothing.
+/// A row wired to a neighbour's field type-checks, so each case sets one field and a wrong projection reads nothing.
 #[test]
 fn every_registered_feature_reads_its_own_remote_setting() {
     for spec in FEATURES {
@@ -86,6 +95,7 @@ fn every_registered_feature_reads_its_own_remote_setting() {
             Feature::VoiceMode => settings.voice_mode_enabled = Some(value),
             Feature::WriteFile => settings.write_file_enabled = Some(value),
             Feature::Feedback => settings.feedback_enabled = Some(value),
+            Feature::FeedbackTraceCard => settings.feedback_trace_card_enabled = Some(value),
             Feature::TurnSummary => settings.turn_summary = Some(value),
             Feature::CancelRewind => settings.cancel_rewind_enabled = Some(value),
             Feature::CompactionVerbatimInput => settings.compaction_verbatim_input = Some(value),
@@ -94,8 +104,12 @@ fn every_registered_feature_reads_its_own_remote_setting() {
             Feature::SubagentWorktreeSnapshot => {
                 settings.subagent_worktree_snapshot_enabled = Some(value)
             }
-            // The one row with no remote tier, stated as such rather than as a
-            // projection that reads nothing.
+            Feature::ActiveAgentMessages => settings.active_agent_messages_enabled = Some(value),
+            Feature::RepoStatusInSystemPrompt => {
+                settings.repo_status_in_system_prompt = Some(value)
+            }
+            Feature::Dock => settings.dock_enabled = Some(value),
+            // The one row with no remote tier, stated as such rather than as a projection that reads nothing
             Feature::BackendTools => {
                 assert!(spec.remote.is_none(), "{} grew a remote tier", spec.key);
                 continue;

@@ -719,6 +719,10 @@ fn gc_report_serde_round_trip() {
         not_judged: 0,
         unnamed: 2,
         names_collected: 7,
+        pin_gc_examined: 2,
+        pin_gc_pruned: 1,
+        pin_gc_deferred: 0,
+        pin_gc_kept: 1,
     };
     let json = serde_json::to_string(&report).unwrap();
     let deser: gc::GcReport = serde_json::from_str(&json).unwrap();
@@ -951,7 +955,7 @@ fn per_kind_age_expiry_reclaims_listed_kinds_and_keeps_the_rest() {
         records: Vec<(&'static str, WorktreeKind, i64)>,
         opts: gc::GcOptions,
         survivors: Vec<&'static str>,
-        expired_removed: usize,
+        expired_removed: u64,
     }
     let cases = vec![
         Case {
@@ -1109,20 +1113,4 @@ fn dry_run_counts_per_kind_cutoffs() {
     .unwrap();
     assert_eq!(dry0.expired_removed, 2);
     assert!(dry0.never_expiring >= 1);
-}
-
-#[test]
-fn db_stats_serde_round_trip() {
-    let stats = crate::db::DbStats {
-        total_records: 10,
-        alive_count: 7,
-        dead_count: 3,
-        db_file_bytes: 4096,
-    };
-    let json = serde_json::to_string(&stats).unwrap();
-    let deser: crate::db::DbStats = serde_json::from_str(&json).unwrap();
-    assert_eq!(deser.total_records, 10);
-    assert_eq!(deser.alive_count, 7);
-    assert_eq!(deser.dead_count, 3);
-    assert_eq!(deser.db_file_bytes, 4096);
 }
