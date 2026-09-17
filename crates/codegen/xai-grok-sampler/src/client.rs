@@ -90,7 +90,12 @@ impl GrokRequestHeaders<'_> {
 }
 
 /// Deserialize a Responses SSE event, stripping unknown tools, backfilling omitted usage details, and rewriting terminal `total_tokens` from `context_details`.
-pub(crate) fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
+///
+/// `Ok(None)` reports an event whose `type` the typed enum does not model — a
+/// provider extension or keepalive such as OpenCode Go's `ping`. The caller
+/// skips those: the client cannot act on a shape it does not model, and failing
+/// the turn on a keepalive breaks otherwise healthy streams.
+pub(crate) fn deserialize_response_event(data: &str) -> Result<Option<rs::ResponseStreamEvent>> {
     let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
         Ok(event) => event,
         Err(first_err) => {
@@ -109,8 +114,15 @@ pub(crate) fn deserialize_response_event(data: &str) -> Result<rs::ResponseStrea
                 fill_default_usage_details(&mut value);
                 if let Ok(mut event) = serde_json::from_value::<rs::ResponseStreamEvent>(value) {
                     apply_terminal_event_overrides(&mut event, data);
-                    return Ok(event);
+                    return Ok(Some(event));
                 }
+            }
+            if let Some(event_type) = unmodelled_event_type(&first_err, data) {
+                tracing::debug!(
+                    event_type = %event_type,
+                    "skipping responses stream event with unmodelled type"
+                );
+                return Ok(None);
             }
             tracing::error!(
                 error = %first_err,
@@ -121,7 +133,24 @@ pub(crate) fn deserialize_response_event(data: &str) -> Result<rs::ResponseStrea
         }
     };
     apply_terminal_event_overrides(&mut event, data);
-    Ok(event)
+    Ok(Some(event))
+}
+
+/// Event `type` that `rs::ResponseStreamEvent` cannot represent, or `None` when
+/// the failure was anything else (malformed JSON, missing or mistyped fields).
+///
+/// The typed enum is closed, so a provider that adds an event variant makes
+/// serde fail with `unknown variant \`...\``. Only that class is ignorable;
+/// every other deserialization failure still fails the turn.
+fn unmodelled_event_type(err: &serde_json::Error, data: &str) -> Option<String> {
+    if !err.to_string().starts_with("unknown variant") {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()?
+        .get("type")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// Backfill `response.usage` detail fields that `async_openai`'s typed
@@ -1633,7 +1662,13 @@ impl SamplingClient {
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Some(Err(stream_error)))
                         } else {
-                            Some(Some(deserialize_response_event(data)))
+                            match deserialize_response_event(data) {
+                                Ok(Some(event)) => Some(Some(Ok(event))),
+                                // Unmodelled provider event (keepalive `ping`,
+                                // future variant): skip it, keep streaming.
+                                Ok(None) => Some(None),
+                                Err(err) => Some(Some(Err(err))),
+                            }
                         }
                     }
                     Err(e) => {
@@ -3337,6 +3372,54 @@ mod tests {
         );
     }
 
+    /// Parse a Responses SSE event that the typed enum must model.
+    fn parse_response_event(data: &str) -> rs::ResponseStreamEvent {
+        deserialize_response_event(data)
+            .expect("event parses")
+            .expect("event is modelled by rs::ResponseStreamEvent")
+    }
+
+    /// Regression: OpenCode Go / Console Go send `ping` keepalives between real
+    /// events. The typed enum does not model them; they must be skipped instead
+    /// of aborting the turn with `unknown variant \`ping\``.
+    #[test]
+    fn deserialize_response_event_skips_ping_keepalive() {
+        let event = deserialize_response_event(r#"{"type":"ping","sequence_number":7}"#)
+            .expect("ping must not fail the stream");
+        assert!(event.is_none(), "ping carries no content and is skipped");
+    }
+
+    /// A variant added upstream after this client was built is skipped the same
+    /// way rather than failing an otherwise healthy turn.
+    #[test]
+    fn deserialize_response_event_skips_unmodelled_event_types() {
+        let event = deserialize_response_event(
+            r#"{"type":"response.some_future_event","sequence_number":8}"#,
+        )
+        .expect("unknown variants are skipped");
+        assert!(event.is_none());
+    }
+
+    /// Only `unknown variant` failures are ignorable: a modelled event with a
+    /// broken payload is still an error, so real deserialization bugs surface.
+    #[test]
+    fn deserialize_response_event_still_fails_on_modelled_event_with_bad_payload() {
+        let err = deserialize_response_event(
+            r#"{"type":"response.completed","response":{"id":"resp_x"}}"#,
+        )
+        .expect_err("missing response fields must still fail");
+        assert!(
+            matches!(err, SamplingError::Serialization(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// Malformed JSON is not an unknown variant and keeps failing loudly.
+    #[test]
+    fn deserialize_response_event_still_fails_on_malformed_json() {
+        assert!(deserialize_response_event(r#"{"type":"#).is_err());
+    }
+
     /// `response.completed` carrying `usage.context_details.{input_tokens, output_tokens}` rewrites `usage.total_tokens` in place.
     /// The new value is the live context length (`ctx.input + ctx.output`).
     /// Billing fields stay on the wire's cumulative values.
@@ -3365,7 +3448,7 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = parse_response_event(sse);
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3402,7 +3485,7 @@ mod tests {
             )
         };
 
-        let event = deserialize_response_event(&make(78)).expect("parse");
+        let event = parse_response_event(&make(78));
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3416,7 +3499,7 @@ mod tests {
         );
 
         // The REST mapper backfills 0 for unbilled requests: no stash.
-        let event = deserialize_response_event(&make(0)).expect("parse");
+        let event = parse_response_event(&make(0));
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3447,7 +3530,7 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = parse_response_event(sse);
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3477,7 +3560,7 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = parse_response_event(sse);
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3505,7 +3588,7 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = parse_response_event(sse);
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3537,7 +3620,7 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = parse_response_event(sse);
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3568,7 +3651,7 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = parse_response_event(sse);
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3602,7 +3685,7 @@ mod tests {
                 }
             }
         }"#;
-        let event = deserialize_response_event(sse).expect("parse");
+        let event = parse_response_event(sse);
         let rs::ResponseStreamEvent::ResponseCompleted(e) = event else {
             panic!("expected ResponseCompleted");
         };
@@ -3622,7 +3705,7 @@ mod tests {
             "delta": "hello",
             "logprobs": []
         }"#;
-        let event = deserialize_response_event(sse).expect("non-terminal event parses");
+        let event = parse_response_event(sse);
         assert!(matches!(
             event,
             rs::ResponseStreamEvent::ResponseOutputTextDelta(_)
