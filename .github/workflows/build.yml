@@ -24,10 +24,12 @@ jobs:
             target: aarch64-apple-darwin
             artifact: grok-macos-arm64
             bin: xai-grok-pager
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: grok-windows-x86_64.exe
-            bin: xai-grok-pager.exe
+          # 暂时禁用：Windows 构建约 56 分钟，明显拖慢每次 release。
+          # 需要恢复时取消下面 4 行注释即可（install.ps1 依赖该产物）。
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   artifact: grok-windows-x86_64.exe
+          #   bin: xai-grok-pager.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -61,20 +63,21 @@ jobs:
           export PATH="$RUNNER_TEMP/dotslash-bin:$PATH"
           dotslash --version
 
+      # 随 Windows 构建一起禁用（恢复 Windows 构建时需同时取消本段注释）。
       # bin/protoc is a DotSlash wrapper; Windows runners execute it more
       # reliably via a real protoc.exe + PROTOC (find_protoc checks env first).
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $zip = Join-Path $env:RUNNER_TEMP 'protoc.zip'
-          $dest = Join-Path $env:RUNNER_TEMP 'protoc'
-          Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip' -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $dest -Force
-          $bin = Join-Path $dest 'bin'
-          $exe = Join-Path $bin 'protoc.exe'
-          Add-Content -Path $env:GITHUB_PATH -Value $bin
-          Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$exe"
+      # - name: Install protoc (Windows)
+      #   if: runner.os == 'Windows'
+      #   shell: pwsh
+      #   run: |
+      #     $zip = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+      #     $dest = Join-Path $env:RUNNER_TEMP 'protoc'
+      #     Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip' -OutFile $zip
+      #     Expand-Archive -Path $zip -DestinationPath $dest -Force
+      #     $bin = Join-Path $dest 'bin'
+      #     $exe = Join-Path $bin 'protoc.exe'
+      #     Add-Content -Path $env:GITHUB_PATH -Value $bin
+      #     Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$exe"
 
       - name: Build release binary
         run: cargo build -p xai-grok-pager-bin --release --target ${{ matrix.target }}
