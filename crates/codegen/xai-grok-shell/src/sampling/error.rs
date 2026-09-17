@@ -10,12 +10,8 @@ pub use xai_grok_sampler::SamplingErrorKind;
 
 use agent_client_protocol as acp;
 
-/// ACP error code for rate-limited requests (HTTP 429).
-/// Uses the JSON-RPC implementation-defined server error range (-32000 to -32099).
-///
-/// Contract: set only for actual HTTP 429 responses from the sampling client.
-/// Clients derive user-facing text via [`format_rate_limited_user_message`].
-/// The desktop path (`prompt_complete_fields`) reports the stop reason with no detail.
+/// ACP error code for rate-limited requests (HTTP 429). Uses the JSON-RPC implementation-defined server error range (-32000 to -32099). Contract: set only for actual HTTP 429 responses from the sampling client.
+/// Clients derive user-facing text via [`format_rate_limited_user_message`]. The desktop path (`prompt_complete_fields`) reports the stop reason with no detail.
 pub const RATE_LIMITED_ERROR_CODE: i32 = -32003;
 
 /// OAuth / session rate-limit copy (personal plan upgrade path).
@@ -42,13 +38,9 @@ pub fn is_free_usage_exhausted_error(detail: &str) -> bool {
     detail.contains(FREE_USAGE_EXHAUSTED_ERROR_CODE)
 }
 
-/// User-facing text for an ACP -32003 rate-limit error.
-///
-/// The free-usage code wins first (consumer-only; checked before the API-key rewrite).
-/// An API-key caller whose detail pushes the personal SuperGrok upsell gets the team credits copy instead.
-/// Otherwise the body is shown after stripping the `API error (status …):` prefix (SamplingError Display).
-/// An empty detail falls back to the OAuth or API-key message.
-/// Callers that show this in UI should still run their usual sanitizer (scrub/cap).
+/// User-facing text for an ACP -32003 rate-limit error. The free-usage code wins first (consumer-only; checked before the API-key rewrite).
+/// An API-key caller whose detail pushes the personal SuperGrok upsell gets the team credits copy instead. Otherwise the body is shown after stripping the `API error (status …):` prefix (SamplingError Display).
+/// An empty detail falls back to the OAuth or API-key message. Callers that show this in UI should still run their usual sanitizer (scrub/cap).
 pub fn format_rate_limited_user_message(
     server_detail: Option<&str>,
     is_api_key_auth: bool,
@@ -78,8 +70,9 @@ fn strip_sampling_api_error_prefix(detail: &str) -> &str {
     const SEP: &str = "): ";
     if let Some(rest) = detail.strip_prefix(PREFIX)
         && let Some(idx) = rest.find(SEP)
+        && let Some(body) = rest.get(idx + SEP.len()..)
     {
-        return rest[idx + SEP.len()..].trim();
+        return body.trim();
     }
     detail.trim()
 }
@@ -110,6 +103,7 @@ pub(crate) fn map_sampling_err_to_acp(err: SamplingError) -> acp::Error {
     match err {
         SamplingError::Auth { message, .. } => acp::Error::auth_required().data(message),
         SamplingError::InvalidConfiguration(msg) => acp::Error::invalid_params().data(msg),
+        SamplingError::MtlsConfiguration(msg) => acp::Error::invalid_params().data(msg),
         SamplingError::Http(e) => {
             acp::Error::internal_error().data(format!("http client init failed: {e}"))
         }
@@ -186,10 +180,21 @@ pub(crate) fn error_data_with_status(
     }
 }
 
+pub(crate) fn local_error(code: &str, message: impl Into<String>) -> acp::Error {
+    let mut data = serde_json::json!({ "message": message.into() });
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(ERROR_CODE_DATA_KEY.to_string(), serde_json::json!(code));
+    }
+    acp::Error::internal_error().data(data)
+}
+
 /// `acp::Error.data` key of the typed terminal-error kind marker (stamped by [`terminal_error_data`]).
 /// Snake_case like its shipped `data` siblings (`http_status`); frozen wire format.
 /// The notification paths carry the kind under their own keys/fields (see `extensions::notification::PROMPT_COMPLETE_ERROR_KIND_KEY`).
 const ERROR_KIND_DATA_KEY: &str = "error_kind";
+
+/// `acp::Error.data` key for a local failure's stable `code`; shared by [`local_error`], [`error_code_from_data`], and `session::persistence::io_error_to_acp`.
+pub(crate) const ERROR_CODE_DATA_KEY: &str = "code";
 
 /// `salvage_cause` values stamped on mid-salvage terminal errors and forwarded onto the `shell.turn.length_empty_continuation` event.
 /// EMPTY covers every continuation that cannot be salvaged at the cap: nothing visible, or a truncated tool-call tail.
@@ -210,9 +215,14 @@ pub(crate) fn terminal_error_data(
         return error_data_with_status(message, http_status);
     }
     let mut data = serde_json::json!({ "message": message });
-    data[ERROR_KIND_DATA_KEY] = serde_json::json!(kind.as_str());
-    if let Some(sc) = http_status {
-        data["http_status"] = serde_json::json!(sc);
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            ERROR_KIND_DATA_KEY.to_string(),
+            serde_json::json!(kind.as_ref()),
+        );
+        if let Some(sc) = http_status {
+            obj.insert("http_status".to_string(), serde_json::json!(sc));
+        }
     }
     data
 }
@@ -221,6 +231,10 @@ pub(crate) fn terminal_error_data(
 /// The pager maps an unknown kind to its `Other`, keeping it immune to text recovery.
 pub fn error_kind_str_from_error(err: &acp::Error) -> Option<&str> {
     err.data.as_ref()?.get(ERROR_KIND_DATA_KEY)?.as_str()
+}
+
+pub fn error_code_from_data(err: &acp::Error) -> Option<&str> {
+    err.data.as_ref()?.get(ERROR_CODE_DATA_KEY)?.as_str()
 }
 
 /// Typed view of [`error_kind_str_from_error`] for the shell's own classification, where an unknown kind degrading to `None` (generic) is correct.
@@ -247,10 +261,8 @@ fn error_message_from_data(data: &serde_json::Value) -> serde_json::Value {
     data.get("message").cloned().unwrap_or_else(|| data.clone())
 }
 
-/// Internal service names that upstream error bodies echo, rewritten to distinct sentence-friendly backend labels before display.
-/// The labels stay distinct so a user paste keeps the failing hop.
-/// Shared by shell and pager so the redaction cannot drift; apply via [`rewrite_service_names`] (case-insensitive, no cased variants here).
-/// No replacement value may re-match a pattern (pinned by test).
+/// Internal service names that upstream error bodies echo, rewritten to distinct sentence-friendly backend labels before display. The labels stay distinct so a user paste keeps the failing hop.
+/// Shared by shell and pager so the redaction cannot drift; apply via [`rewrite_service_names`] (case-insensitive, no cased variants here). No replacement value may re-match a pattern (pinned by test).
 pub const SERVICE_NAME_REWRITES: &[(&str, &str)] = &[
     ("cli-chat-proxy", "build backend"),
     ("cli_chat_proxy", "build backend"),
@@ -283,13 +295,17 @@ fn replace_ascii_case_insensitive(text: &str, pattern: &str, replacement: &str) 
     let lower_pattern = pattern.to_ascii_lowercase();
     let mut out = String::with_capacity(text.len());
     let mut idx = 0;
-    while let Some(pos) = lower_text[idx..].find(&lower_pattern) {
+    while let Some(pos) = lower_text.get(idx..).and_then(|s| s.find(&lower_pattern)) {
         let start = idx + pos;
-        out.push_str(&text[idx..start]);
+        if let Some(chunk) = text.get(idx..start) {
+            out.push_str(chunk);
+        }
         out.push_str(replacement);
         idx = start + pattern.len();
     }
-    out.push_str(&text[idx..]);
+    if let Some(tail) = text.get(idx..) {
+        out.push_str(tail);
+    }
     out
 }
 
@@ -734,11 +750,9 @@ mod tests {
         assert_eq!(acp_err.code, acp::Error::auth_required().code);
     }
 
-    /// Regression test: 403 Forbidden must not map to auth_required.
-    /// The cli-chat-proxy returns 403 for policy denials unrelated to the caller's credentials.
+    /// Regression test: 403 Forbidden must not map to auth_required. The cli-chat-proxy returns 403 for policy denials unrelated to the caller's credentials.
     /// Examples: content-safety blocks like SAFETY_CHECK_TYPE_DATA_LEAKAGE, ZDR-gated operations, remote settings blocks.
-    /// Mapping these to auth_required makes the desktop app tear down the session and start silent re-auth on -32000.
-    /// That can race with invalid_grant_threshold to wipe auth.json.
+    /// Mapping these to auth_required makes the desktop app tear down the session and start silent re-auth on -32000. That can race with invalid_grant_threshold to wipe auth.json.
     #[test]
     fn forbidden_does_not_map_to_auth_required() {
         let err = SamplingError::Api {

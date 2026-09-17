@@ -12,6 +12,7 @@ pub mod acp_command;
 pub mod command;
 pub mod commands;
 pub mod matcher;
+pub(crate) mod mid_text_hoist;
 pub mod mode_support;
 pub mod mru;
 pub mod registry;
@@ -36,10 +37,6 @@ pub use mode_support::{ModeSupport, Remedy};
 
 /// Maximum number of visible rows in the dropdown (scroll beyond this).
 pub const MAX_VISIBLE_SUGGESTIONS: usize = 8;
-
-// ---------------------------------------------------------------------------
-// SuggestionRow
-// ---------------------------------------------------------------------------
 
 /// Grouping for the bare `/` menu, ordered top to bottom. Skills sink below the commands because there can be far more of them than fit on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -236,12 +233,7 @@ fn sync_inline_ghost_to_selection(inner: &mut SlashSnapshot) {
         .and_then(|row| inline_ghost_from_selected_command(&inner.query, range, row));
 }
 
-// ---------------------------------------------------------------------------
-// SlashSnapshot / SlashState
-// ---------------------------------------------------------------------------
-
 /// Immutable snapshot of the slash completion state.
-///
 /// Produced by `SlashController::refresh()`, consumed by the dropdown renderer.
 /// Cloned on read (cheap: small vecs).
 #[derive(Debug, Clone, Default)]
@@ -300,7 +292,6 @@ impl SlashSnapshot {
 }
 
 /// Mutable holder for [`SlashSnapshot`].
-///
 /// Uses `RefCell` for interior mutability: the controller writes it, the renderer reads it.
 /// Not a trait, just a state container.
 #[derive(Debug, Default)]
@@ -337,12 +328,7 @@ impl SlashState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SlashController
-// ---------------------------------------------------------------------------
-
 /// Derives slash completion state from prompt text and cursor.
-///
 /// Owns a `CommandRegistry` (mutable for ACP sync) and a `FuzzyMatcher`.
 /// The prompt widget calls `refresh()` on every text change.
 pub struct SlashController {
@@ -381,7 +367,6 @@ pub struct SlashController {
 
 impl SlashController {
     /// Create a new controller with the given registry and working directory.
-    ///
     /// The MRU store defaults to an isolated, in-memory (non-persisting) store.
     /// Production injects the shared store via [`Self::set_mru`].
     pub fn new(registry: CommandRegistry, cwd: std::path::PathBuf) -> Self {
@@ -562,11 +547,8 @@ impl SlashController {
         self.registry.set_auto_mode_available(available);
     }
 
-    /// Suppress (or restore) session-scoped commands in completion.
-    ///
-    /// Called once on session-less surfaces (the agent dashboard's dispatch input).
-    /// Commands that act on a single session then never appear in the dropdown or inline ghost.
-    /// See [`SlashCommand::session_scoped`].
+    /// Suppress (or restore) session-scoped commands in completion. Commands that act on a single session then never
+    /// appear in the dropdown or inline ghost.
     pub fn set_hide_session_scoped(&mut self, hide: bool) {
         self.hide_session_scoped = hide;
     }
@@ -620,7 +602,7 @@ impl SlashController {
         let args_text_empty = input
             .args_range
             .as_ref()
-            .is_some_and(|r| text[r.start..r.end].trim().is_empty());
+            .is_some_and(|r| text.get(r.start..r.end).is_none_or(|s| s.trim().is_empty()));
         let mut snapshot = SlashSnapshot {
             active: true,
             open: false,
@@ -638,10 +620,8 @@ impl SlashController {
             recognized_tokens: Vec::new(),
         };
 
-        // Cursor inside the command token opens the command menu even when args follow, same as mid-text tokens
-        // That covers `/` typed at the start of existing text via ctrl-a
-        // The query is cursor-clamped, so `/` before existing text shows the full list like an empty composer
-        // The two branches partition: analyze_input sets args_range exactly when the cursor is past the command token
+        // Cursor inside the command token opens the command menu even when args follow, same as mid-text tokens. The two
+        // branches partition: analyze_input sets args_range exactly when the cursor is past the command token.
         if input.cursor_in_command {
             let matches = self.command_suggestions(&input.query, models);
             snapshot.selected = Self::carry_selection(&previous, &matches, true, &input);
@@ -670,10 +650,9 @@ impl SlashController {
             }
         }
 
-        // Also scan for mid-text slash tokens (after the first one)
-        // Prompts like "/model foo /comm" then get ghost text and teal highlighting on the second and subsequent `/` tokens
-        // compute_inline_slash only supplies recognized-token highlights now
-        // The inline ghost is derived solely from the dropdown selection (one ranker, shared with Tab) via sync_inline_ghost_to_selection below
+        // Also scan for mid-text slash tokens (after the first one). Prompts like "/model foo /comm" then get ghost text
+        // and teal highlighting on the second and subsequent `/` tokens compute_inline_slash only supplies
+        // recognized-token highlights now.
         let inline = self.compute_inline_slash(text, models);
         snapshot.recognized_tokens = inline.recognized_tokens;
         sync_inline_ghost_to_selection(&mut snapshot);
@@ -798,16 +777,18 @@ impl SlashController {
             return snapshot;
         }
 
-        let token_with_slash = &text[token.range.start..token.range.end];
+        let Some(token_with_slash) = text.get(token.range.start..token.range.end) else {
+            return snapshot;
+        };
         if parse_invocation(token_with_slash).is_none() {
             return snapshot;
         }
 
         let args_start = token.range.end;
         if args_start >= text.len()
-            || !text[args_start..]
-                .chars()
-                .next()
+            || !text
+                .get(args_start..)
+                .and_then(|s| s.chars().next())
                 .is_some_and(|ch| ch.is_whitespace())
         {
             return snapshot;
@@ -815,7 +796,7 @@ impl SlashController {
 
         let mut start = args_start;
         while start < text.len() {
-            let ch = match text[start..].chars().next() {
+            let ch = match text.get(start..).and_then(|s| s.chars().next()) {
                 Some(ch) => ch,
                 None => break,
             };
@@ -826,9 +807,14 @@ impl SlashController {
             }
         }
         let args_end = next_slash_token_start(all_tokens, token).unwrap_or(text.len());
-        let args_empty = start >= args_end || text[start..args_end].trim().is_empty();
+        let args_empty = start >= args_end
+            || text
+                .get(start..args_end)
+                .is_none_or(|s| s.trim().is_empty());
         let args_query = if cursor > start {
-            text[start..cursor.min(args_end)].to_string()
+            text.get(start..cursor.min(args_end))
+                .unwrap_or("")
+                .to_owned()
         } else {
             String::new()
         };
@@ -919,11 +905,9 @@ impl SlashController {
         previous.selected.min(matches.len().saturating_sub(1))
     }
 
-    /// Byte ranges of recognized `/command` tokens anywhere in `text`.
-    ///
-    /// Both the composer's teal token highlighting and the scrollback echo of submitted prompts read this.
-    /// A token counts when it is a whitespace-preceded `/{word}` whose name resolves to a command offered on this surface.
-    /// See [`scan_inline_slash_tokens`] and [`command_offered`]. Cursor-independent. Empty when nothing is recognized.
+    /// Byte ranges of recognized `/command` tokens anywhere in `text`. Both the composer's teal token highlighting and
+    /// the scrollback echo of submitted prompts read this. See [`scan_inline_slash_tokens`] and [`command_offered`].
+    /// Cursor-independent. Empty when nothing is recognized.
     pub fn recognized_token_ranges(&self, text: &str, models: &ModelState) -> Vec<Range<usize>> {
         let tokens = scan_inline_slash_tokens(text, 0);
         if tokens.is_empty() {
@@ -943,7 +927,6 @@ impl SlashController {
     }
 
     /// Compute inline slash state for text that doesn't start with `/`.
-    ///
     /// Recognized-token highlights only ([`Self::recognized_token_ranges`]).
     /// Ghost for partial commands comes solely from [`sync_inline_ghost_to_selection`] (dropdown selection).
     fn compute_inline_slash(&self, text: &str, models: &ModelState) -> SlashSnapshot {
@@ -960,8 +943,10 @@ impl SlashController {
         let ctx = self.app_ctx(models);
         let hide_session = self.hide_session_scoped;
         let visible_indices: HashSet<usize> = (0..self.registry.triggers().len())
-            .filter(|i| {
-                let trigger = &self.registry.triggers()[*i];
+            .filter(|&i| {
+                let Some(trigger) = self.registry.triggers().get(i) else {
+                    return false;
+                };
                 self.registry
                     .commands_by_index(trigger.command_index)
                     .is_some_and(|cmd| command_offered(cmd.as_ref(), &ctx, hide_session))
@@ -1072,7 +1057,9 @@ impl SlashController {
         // Dedup per command: higher score, else exact query, else canonical, else display.
         let mut best_per_command: HashMap<usize, (u32, usize)> = HashMap::new();
         for (visible_idx, score) in hits {
-            let trigger = visible_triggers[visible_idx];
+            let Some(trigger) = visible_triggers.get(visible_idx).copied() else {
+                continue;
+            };
             best_per_command
                 .entry(trigger.command_index)
                 .and_modify(|current| {
@@ -1080,16 +1067,22 @@ impl SlashController {
                         score > current.0
                     } else {
                         let new_exact = trigger_exact_query(trigger, trimmed);
-                        let cur_exact = trigger_exact_query(visible_triggers[current.1], trimmed);
+                        let cur_exact = visible_triggers
+                            .get(current.1)
+                            .is_some_and(|t| trigger_exact_query(t, trimmed));
                         if new_exact != cur_exact {
                             new_exact
                         } else {
                             let new_canonical = trigger.alias.is_none();
-                            let cur_canonical = visible_triggers[current.1].alias.is_none();
+                            let cur_canonical = visible_triggers
+                                .get(current.1)
+                                .is_some_and(|t| t.alias.is_none());
                             if new_canonical != cur_canonical {
                                 new_canonical
                             } else {
-                                trigger.display < visible_triggers[current.1].display
+                                visible_triggers
+                                    .get(current.1)
+                                    .is_some_and(|t| trigger.display < t.display)
                             }
                         }
                     };
@@ -1145,21 +1138,30 @@ impl SlashController {
             .collect();
         deduped.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| owns_typed_name[b.1].cmp(&owns_typed_name[a.1]))
-                .then_with(|| mru_scores[b.1].cmp(&mru_scores[a.1]))
+                .then_with(|| owns_typed_name.get(b.1).cmp(&owns_typed_name.get(a.1)))
+                .then_with(|| mru_scores.get(b.1).cmp(&mru_scores.get(a.1)))
                 .then_with(|| {
-                    let a_builtin = sort_meta[a.1].1 == CommandSource::Builtin;
-                    let b_builtin = sort_meta[b.1].1 == CommandSource::Builtin;
+                    let a_builtin = sort_meta
+                        .get(a.1)
+                        .is_some_and(|m| m.1 == CommandSource::Builtin);
+                    let b_builtin = sort_meta
+                        .get(b.1)
+                        .is_some_and(|m| m.1 == CommandSource::Builtin);
                     b_builtin.cmp(&a_builtin)
                 })
-                .then_with(|| rows[a.1].display.cmp(&rows[b.1].display))
+                .then_with(|| match (rows.get(a.1), rows.get(b.1)) {
+                    (Some(ra), Some(rb)) => ra.display.cmp(&rb.display),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
         });
         deduped
             .into_iter()
-            .map(|(_, idx)| {
-                let mut row = rows[idx].clone();
+            .filter_map(|(_, idx)| {
+                let mut row = rows.get(idx)?.clone();
                 row.indices = self.matcher.indices(row.display.as_str());
-                row
+                Some(row)
             })
             .collect()
     }
@@ -1229,35 +1231,18 @@ impl SlashController {
                 item.match_text.as_str()
             });
         hits.into_iter()
-            .map(|(idx, _)| {
-                let mut row = SuggestionRow::from_arg(&items[idx]);
+            .filter_map(|(idx, _)| {
+                let mut row = SuggestionRow::from_arg(items.get(idx)?);
                 row.indices = self.argument_highlight_indices(trimmed, &row.display);
-                row
+                Some(row)
             })
             .collect()
     }
 }
 
-/// Whether `command` should be offered for completion **or execution** on the current surface.
-///
-/// Combines the command's own [`SlashCommand::visible`] gate with the controller's session-scope policy.
-/// `hide_session_scoped` is set on session-less surfaces such as the agent dashboard's dispatch input.
-/// There, commands that act on a single session (`/compact`, `/fork`, `/rewind`) are suppressed: no "current session" exists for them to operate on.
-///
-/// Commands that opt in via [`SlashCommand::offered_when_session_less`] (`/model`, `/plan`, `/multiline`) are exempt from this suppression.
-/// They configure the next spawn or the dashboard input surface itself.
-///
-/// Conversely, [`SlashCommand::dashboard_only`] commands (`/cd`) are offered only when `hide_session_scoped` is set (the dashboard surface).
-/// They are suppressed on every session surface.
-///
-/// Commands are also filtered by the render mode they declare support for ([`SlashCommand::mode_support`]).
-/// A fullscreen-only command (`/find`, `/theme`, …) is not offered under `--minimal`.
-/// A minimal-only command (`/expand`) is not offered in the full TUI.
-/// This gate is completion-only: [`registry::CommandRegistry::get_for_dispatch`] still resolves such a command.
-/// A fully-typed invocation thus reaches the central dispatch gate's [`ModeSupport::refusal`] instead of leaking to the model as a raw prompt.
-///
-/// Callers that execute slash commands on a session-less surface (e.g. `dispatch_dashboard_dispatch_slash`) must consult this before `command.run`.
-/// Typed tokens that were filtered from the dropdown then fall through as ordinary prompt text rather than running invisibly.
+/// Conversely, [`SlashCommand::dashboard_only`] commands (`/cd`) are offered only when `hide_session_scoped` is set
+/// (the dashboard surface). A fullscreen-only command (`/find`, `/theme`, …) is not offered under `--minimal`. A
+/// minimal-only command (`/expand`) is not offered in the full TUI.
 pub(crate) fn command_offered(
     command: &dyn SlashCommand,
     ctx: &AppCtx,
@@ -1273,10 +1258,6 @@ pub(crate) fn command_offered(
         // Offered only when the command isn't dashboard-only or we're on the dashboard
         && (!command.dashboard_only() || hide_session_scoped)
 }
-
-// ---------------------------------------------------------------------------
-// Input analysis
-// ---------------------------------------------------------------------------
 
 /// Parsed input structure for slash completion.
 struct SlashInput {
@@ -1296,7 +1277,10 @@ fn analyze_input(text: &str, cursor: usize) -> Option<SlashInput> {
     }
 
     let cursor = cursor.min(text.len());
-    if text[1..].chars().all(|ch| ch.is_whitespace()) {
+    if text
+        .get(1..)
+        .is_none_or(|rest| rest.chars().all(char::is_whitespace))
+    {
         return Some(SlashInput {
             command_range: 0..1,
             query: String::new(),
@@ -1321,7 +1305,7 @@ fn analyze_input(text: &str, cursor: usize) -> Option<SlashInput> {
     let query = if query_end <= 1 {
         String::new()
     } else {
-        text[1..query_end].to_string()
+        text.get(1..query_end)?.to_owned()
     };
 
     let cursor_in_command = cursor <= command_end;
@@ -1331,7 +1315,7 @@ fn analyze_input(text: &str, cursor: usize) -> Option<SlashInput> {
     if !cursor_in_command {
         let mut start = command_end;
         while start < text.len() {
-            let ch = match text[start..].chars().next() {
+            let ch = match text.get(start..).and_then(|s| s.chars().next()) {
                 Some(ch) => ch,
                 None => break,
             };
@@ -1344,7 +1328,7 @@ fn analyze_input(text: &str, cursor: usize) -> Option<SlashInput> {
         let end = text.len();
         let query_end = cursor.clamp(start, end);
         if query_end > start {
-            args_query = text[start..query_end].to_string();
+            args_query = text.get(start..query_end)?.to_owned();
         }
         args_range = Some(start..end);
     }
@@ -1357,10 +1341,6 @@ fn analyze_input(text: &str, cursor: usize) -> Option<SlashInput> {
         args_query,
     })
 }
-
-// ---------------------------------------------------------------------------
-// Invocation parsing
-// ---------------------------------------------------------------------------
 
 /// Parsed slash command invocation.
 pub struct SlashInvocation<'a> {
@@ -1386,33 +1366,21 @@ pub fn parse_invocation(line: &str) -> Option<SlashInvocation<'_>> {
             break;
         }
     }
-    let token = remainder[..command_end].trim();
+    let token = remainder.get(..command_end)?.trim();
     if token.is_empty() {
         return None;
     }
     let args = if command_end < remainder.len() {
-        remainder[command_end..].trim_start()
+        remainder.get(command_end..)?.trim_start()
     } else {
         ""
     };
     Some(SlashInvocation { token, args })
 }
 
-// ---------------------------------------------------------------------------
-// Completeness check
-// ---------------------------------------------------------------------------
-
-/// Check if a slash command line is complete (ready to execute on Enter).
-///
-/// Uses the two-bit model: `takes_args()` and `args_required()`.
-///
-/// | `takes_args` | `args_required` | Enter with no args |
-/// |-------------|----------------|-------------------|
-/// | `false`     | `false`        | Executes          |
-/// | `true`      | `false`        | Executes          |
-/// | `true`      | `true`         | Blocks            |
-///
-/// Unknown commands (not in registry) are treated as complete; they will pass through to the shell.
+/// Check if a slash command line is complete (ready to execute on Enter). | `takes_args` | `args_required` | Enter
+/// with no args |. | `false` | `false` | Executes |. | `true` | `false` | Executes |. | `true` | `true` | Blocks |.
+/// Unknown commands (not in registry) are treated as complete. they will pass through to the shell.
 pub fn is_command_complete(line: &str, registry: &CommandRegistry) -> bool {
     let Some(invocation) = parse_invocation(line) else {
         return false;
@@ -1435,14 +1403,8 @@ pub fn is_command_complete(line: &str, registry: &CommandRegistry) -> bool {
     !invocation.args.trim().is_empty()
 }
 
-/// True when `text` is a complete invocation of a pager builtin, a name only this process honors.
-///
-/// The criterion is ownership, not outcome. A pager-owned name must never be sent to the model as
-/// text: the agent's `resolve()` reserves those names without handling them. ACP, skill, and
-/// unknown names belong to that `resolve()` and already round-trip correctly as queue text, so they
-/// are excluded. Restricted commands are excluded too: `get_for_dispatch` returns `None` for them.
-///
-/// Some builtins enqueue rather than execute (`/compact`, `/imagine`, `/loop`): dispatch re-adds
+/// A pager-owned name must never be sent to the model as text: the agent's `resolve()` reserves those names without
+/// handling them. Some builtins enqueue rather than execute (`/compact`, `/imagine`, `/loop`): dispatch re-adds
 /// those at the tail of the local queue, so the row's position is not preserved.
 pub(crate) fn is_complete_builtin_invocation(text: &str, registry: &CommandRegistry) -> bool {
     let trimmed = text.trim();
@@ -1455,7 +1417,6 @@ pub(crate) fn is_complete_builtin_invocation(text: &str, registry: &CommandRegis
 }
 
 /// True when Enter should send `text` unchanged.
-///
 /// Accept turns `/doctor` into `/doctor ` and opens the arg menu.
 /// Skip accept only when the highlighted row is the typed command (or an alias of it).
 pub(crate) fn is_typed_slash_selected(
@@ -1485,10 +1446,6 @@ pub(crate) fn is_typed_slash_selected(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Mid-text inline slash token scanning
-// ---------------------------------------------------------------------------
 
 /// A `/token` found anywhere in the input text.
 #[derive(Debug, Clone)]
@@ -1594,7 +1551,6 @@ fn should_use_mid_text_refresh(
 }
 
 /// Scan input for all `/word` tokens at any position.
-///
 /// A slash token is `/` followed by one or more non-whitespace chars.
 /// The `/` must be at position 0 or preceded by whitespace, which avoids matching file paths like `foo/bar`.
 pub fn scan_inline_slash_tokens(text: &str, cursor: usize) -> Vec<InlineSlashToken> {
@@ -1608,7 +1564,9 @@ pub fn scan_inline_slash_tokens(text: &str, cursor: usize) -> Vec<InlineSlashTok
         }
         // `/` must be at start or preceded by whitespace.
         if idx > 0 {
-            let prev_byte = text.as_bytes()[idx - 1];
+            let Some(&prev_byte) = idx.checked_sub(1).and_then(|j| text.as_bytes().get(j)) else {
+                continue;
+            };
             if !prev_byte.is_ascii_whitespace() {
                 continue;
             }
@@ -1626,7 +1584,9 @@ pub fn scan_inline_slash_tokens(text: &str, cursor: usize) -> Vec<InlineSlashTok
         if name_end <= name_start {
             continue; // bare `/` with nothing after
         }
-        let name = text[name_start..name_end].to_string();
+        let Some(name) = text.get(name_start..name_end).map(str::to_owned) else {
+            continue;
+        };
         let range = idx..name_end;
         let has_cursor = cursor >= range.start && cursor <= range.end;
         tokens.push(InlineSlashToken {
@@ -1637,10 +1597,6 @@ pub fn scan_inline_slash_tokens(text: &str, cursor: usize) -> Vec<InlineSlashTok
     }
     tokens
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1681,8 +1637,6 @@ mod tests {
     fn rejects_empty_string() {
         assert!(parse_invocation("").is_none());
     }
-
-    // -- is_command_complete tests --
 
     fn test_registry() -> CommandRegistry {
         CommandRegistry::new(commands::builtin_commands())
@@ -1765,8 +1719,6 @@ mod tests {
             "a tier-gated command must stay saved as text, not run from a queue row"
         );
     }
-
-    // -- Controller tests --
 
     #[test]
     fn controller_surfaces_commands_without_query() {
@@ -2173,8 +2125,6 @@ mod tests {
         );
     }
 
-    // -- session-scoped surface filtering (agent dashboard) --
-
     /// On a session-less surface (the agent dashboard's dispatch input), commands that act on a single session are suppressed from completion.
     /// Pager-global commands remain. See `SlashCommand::session_scoped`.
     #[test]
@@ -2369,25 +2319,27 @@ mod tests {
         );
     }
 
-    // -- scan_inline_slash_tokens tests --
-
     #[test]
     fn scan_finds_mid_text_slash_token() {
         let tokens = scan_inline_slash_tokens("do /model now", 6);
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].name, "model");
-        assert_eq!(tokens[0].range, 3..9);
-        assert!(tokens[0].has_cursor);
+        let [token] = tokens.as_slice() else {
+            panic!("expected one token: {tokens:?}");
+        };
+        assert_eq!(token.name, "model");
+        assert_eq!(token.range, 3..9);
+        assert!(token.has_cursor);
     }
 
     #[test]
     fn scan_finds_multiple_tokens() {
         let tokens = scan_inline_slash_tokens("run /commit and /review", 4);
-        assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0].name, "commit");
-        assert_eq!(tokens[1].name, "review");
-        assert!(tokens[0].has_cursor);
-        assert!(!tokens[1].has_cursor);
+        let [commit, review] = tokens.as_slice() else {
+            panic!("expected two tokens: {tokens:?}");
+        };
+        assert_eq!(commit.name, "commit");
+        assert_eq!(review.name, "review");
+        assert!(commit.has_cursor);
+        assert!(!review.has_cursor);
     }
 
     #[test]
@@ -2399,9 +2351,11 @@ mod tests {
     #[test]
     fn scan_handles_start_of_line() {
         let tokens = scan_inline_slash_tokens("/exit now", 3);
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].name, "exit");
-        assert!(tokens[0].has_cursor);
+        let [token] = tokens.as_slice() else {
+            panic!("expected one token: {tokens:?}");
+        };
+        assert_eq!(token.name, "exit");
+        assert!(token.has_cursor);
     }
 
     #[test]
@@ -2413,11 +2367,11 @@ mod tests {
     #[test]
     fn scan_cursor_at_token_end() {
         let tokens = scan_inline_slash_tokens("run /model", 10);
-        assert_eq!(tokens.len(), 1);
-        assert!(tokens[0].has_cursor, "cursor at end of token should match");
+        let [token] = tokens.as_slice() else {
+            panic!("expected one token: {tokens:?}");
+        };
+        assert!(token.has_cursor, "cursor at end of token should match");
     }
-
-    // -- Inline ghost text tests --
 
     #[test]
     fn inline_ghost_for_partial_command() {
@@ -2465,7 +2419,10 @@ mod tests {
             selected_name.starts_with('p'),
             "selected row for query 'p' should start with p, got {selected_name}"
         );
-        assert_eq!(ghost.text, &selected_name[1..]);
+        let Some(ghost_rest) = selected_name.get(1..) else {
+            panic!("selected row should start with p, got {selected_name}");
+        };
+        assert_eq!(ghost.text, ghost_rest);
     }
 
     #[test]
@@ -2757,7 +2714,10 @@ mod tests {
         );
         assert_eq!(skill.description, "Acme SSO helper");
 
-        assert_eq!(snap.matches[0].display, "/login");
+        assert_eq!(
+            snap.matches.first().map(|m| m.display.as_str()),
+            Some("/login")
+        );
 
         assert!(
             !skill.indices.is_empty(),
@@ -2775,8 +2735,8 @@ mod tests {
         ctrl.record_command_use("acme:login", "acme:login");
         ctrl.refresh(&state, "/login", 6, &models);
         assert_eq!(
-            state.snapshot().matches[0].display,
-            "/login",
+            state.snapshot().matches.first().map(|m| m.display.as_str()),
+            Some("/login"),
             "recently-used colliding skill must not hijack the typed builtin name"
         );
     }
@@ -3112,7 +3072,7 @@ mod tests {
             "fully recognized command should not show ghost"
         );
         assert_eq!(snapshot.recognized_tokens.len(), 1);
-        assert_eq!(snapshot.recognized_tokens[0], 3..9);
+        assert_eq!(snapshot.recognized_tokens.first(), Some(&(3..9)));
     }
 
     #[test]
@@ -3369,7 +3329,10 @@ mod tests {
         ctrl.refresh(&state, "/chain fir", 10, &models);
         let snap = state.snapshot();
         assert!(snap.open);
-        assert_eq!(snap.matches[0].indices, vec![0, 1, 2]);
+        assert_eq!(
+            snap.matches.first().map(|m| m.indices.as_slice()),
+            Some([0, 1, 2].as_slice())
+        );
 
         // Typing "first " triggers the phase-2 sub-menu of terminal rows.
         ctrl.refresh(&state, "/chain first ", 13, &models);
@@ -3384,7 +3347,10 @@ mod tests {
         ctrl.refresh(&state, "/chain first al", 15, &models);
         let snap = state.snapshot();
         assert!(snap.open);
-        assert_eq!(snap.matches[0].indices, vec![0, 1]);
+        assert_eq!(
+            snap.matches.first().map(|m| m.indices.as_slice()),
+            Some([0, 1].as_slice())
+        );
     }
 
     #[test]
@@ -3432,8 +3398,11 @@ mod tests {
             ctrl.refresh(&state, text, text.len(), &models);
             let snapshot = state.snapshot();
             assert!(snapshot.open, "no matches for {text:?}");
-            assert_eq!(snapshot.matches[0].insert_text, inserted);
-            assert_eq!(snapshot.matches[0].indices, indices, "{text:?}");
+            let Some(first) = snapshot.matches.first() else {
+                panic!("no matches for {text:?}");
+            };
+            assert_eq!(first.insert_text, inserted);
+            assert_eq!(first.indices, indices, "{text:?}");
         }
 
         for text in [

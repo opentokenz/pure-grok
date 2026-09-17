@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
-use crate::implementations::skills::skill::{SkillOutput, extract_skill_body, format_skill_name};
+use crate::implementations::skills::skill::{
+    SkillOutput, cap_skill_body, extract_skill_body, format_skill_name,
+};
 use crate::implementations::skills::types::SkillInfo;
 use crate::types::requirements::{Expr, ToolRequirement};
 #[allow(unused_imports)]
@@ -87,14 +89,9 @@ enum FindSkillResult<'a> {
     NotFound,
 }
 
-/// Find a skill by name from the available skills list.
-///
-/// Supports both fully-qualified names (`"local:commit"`) and
-/// short names (`"commit"`).
-///
-/// When a short name matches multiple skills across scopes, returns
-/// `Ambiguous` with the qualified names so the caller can ask for
-/// disambiguation instead of silently picking first-match.
+/// Find a skill by name from the available skills list. Supports both fully-qualified names (`"local:commit"`) and
+/// short names (`"commit"`). When a short name matches multiple skills across scopes, returns `Ambiguous` with the
+/// qualified names so the caller can ask for disambiguation instead of silently picking first-match.
 fn find_skill<'a>(name: &str, skills: &'a [SkillInfo]) -> FindSkillResult<'a> {
     // First try exact match with fully qualified name -- always unambiguous.
     if let Some(skill) = skills
@@ -109,9 +106,9 @@ fn find_skill<'a>(name: &str, skills: &'a [SkillInfo]) -> FindSkillResult<'a> {
         .iter()
         .filter(|s| s.enabled && s.name == name)
         .collect();
-    match matches.len() {
-        0 => FindSkillResult::NotFound,
-        1 => FindSkillResult::Found(matches[0]),
+    match matches.as_slice() {
+        [] => FindSkillResult::NotFound,
+        [skill] => FindSkillResult::Found(skill),
         _ => {
             let qualified: Vec<String> = matches.iter().map(|s| format_skill_name(s)).collect();
             FindSkillResult::Ambiguous(qualified)
@@ -297,7 +294,7 @@ impl xai_tool_runtime::Tool for SkillTool {
         };
 
         // ── Load the skill content ───────────────────────────────────
-        let content = match load_skill_content(&skill).await {
+        let mut content = match load_skill_content(&skill).await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(SkillOutput {
@@ -309,6 +306,13 @@ impl xai_tool_runtime::Tool for SkillTool {
                 });
             }
         };
+        if cap_skill_body(&mut content) {
+            tracing::info!(
+                skill = %skill.name,
+                path = %skill.path,
+                "skill body truncated at read cap"
+            );
+        }
 
         // ── List bundled files (up to 10) ────────────────────────────
         let files = list_skill_files(&skill, 10).await;

@@ -31,8 +31,7 @@ impl AppView {
     fn foreign_resume_launch_welcome(&self) -> bool {
         self.active_view == ActiveView::Welcome
             && self.auth_return_view.is_none()
-            && self.agents.is_empty()
-            && self.next_agent_id == 0
+            && self.only_unused_home_or_empty()
             && !self.chat_mode
             && !self.is_zdr_blocked()
             && self.pending_update_version.is_none()
@@ -871,7 +870,7 @@ mod tests {
 
         let entries = entries.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, "native");
+        assert_eq!(entries.first().map(|e| e.id.as_str()), Some("native"));
     }
 
     #[test]

@@ -6,6 +6,7 @@
     dead_code
 )]
 //! Core workspace library: FS, VCS, permissions, tool config, and subsystem wiring.
+#![deny(clippy::indexing_slicing)]
 pub mod activity;
 pub mod capability;
 pub mod channel;
@@ -17,8 +18,10 @@ pub mod export_github;
 pub mod file_system;
 pub mod folder_trust;
 pub mod fs_notify;
+pub(crate) mod git_content_filters;
 pub(crate) mod git_odb;
 pub mod handle;
+pub mod host_kind;
 pub mod hub;
 pub mod hub_auth;
 pub mod hub_channel;
@@ -26,6 +29,7 @@ pub mod hub_ids;
 pub mod hub_server;
 pub mod image_capabilities;
 pub mod mcp;
+pub(crate) mod mcp_claim;
 pub(crate) mod path_virtualization;
 pub mod permission;
 pub mod project_config;
@@ -57,6 +61,7 @@ pub use handle::{
     DrainOutcome, DrainReason, LocalWorkspaceConnectOptions, WorkspaceHandle,
     connect_local_workspace, resolve_workspace_home, termination_grace_from_env,
 };
+pub use host_kind::WorkspaceHostKind;
 pub use hub::HubConfig;
 pub use path_virtualization::{
     ARTIFACTS_ALIAS, BindLifecycleCtx, BindMountError, BindMountHook, PathVirtualization,

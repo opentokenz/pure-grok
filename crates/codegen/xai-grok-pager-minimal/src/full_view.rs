@@ -30,21 +30,15 @@ const FULL_VIEW_WIDTH: u16 = 100;
 /// Frames tick at ~16ms while a build is active (see `AppView::tick_interval_ceiling`).
 const PUMP_BUDGET: Duration = Duration::from_millis(8);
 
-/// Advance the in-progress `/transcript` build by one time-budgeted slice.
-/// Called once per frame from [`crate::draw`]; a no-op when no build is pending (`minimal_api::request_minimal_transcript`).
-///
-/// Why sliced: the full-fidelity transcript is a layout, syntax-highlight, and ANSI-serialization pass over every block.
-/// Doing it in one shot froze the event loop for seconds on long sessions.
-/// It cannot move off-thread: the block model is `!Send` (syntect's resumable highlighter lives inside streaming-markdown blocks).
-/// On completion the file is written and `pending_pager_path` set; the event loop then suspends into `$PAGER`.
+/// Advance the in-progress `/transcript` build by one time-budgeted slice. It cannot move off-thread: the block
+/// model is `!Send` (syntect's resumable highlighter lives inside streaming-markdown blocks).
 pub fn pump_transcript(app: &mut AppView) {
     let Some(mut build) = minimal_api::take_minimal_transcript(app) else {
         return;
     };
-    // Resolve against the build's OWNING agent, never the active view
-    // `EntryId`s are per-`ScrollbackState` counters, so a session switch mid-build must not re-target the snapshot at another agent's scrollback
-    // Id collisions would stitch the transcript from the wrong session
-    // The owner keeps existing across view switches, so the build survives the user tabbing away; only a truly-removed agent drops it
+    // Resolve against the build's OWNING agent, never the active view. `EntryId`s are per-`ScrollbackState` counters,
+    // so a session switch mid-build must not re-target the snapshot at another agent's scrollback. The owner keeps
+    // existing across view switches, so the build survives the user tabbing away; only a truly-removed agent drops it.
     let id = build.agent;
     let appearance = super::commit::committed_appearance(&app.appearance);
     {
@@ -55,19 +49,16 @@ pub fn pump_transcript(app: &mut AppView) {
         let theme = Theme::current();
         let sb = &agent.scrollback;
 
-        // Show every thinking entry THAT EXISTS in the session: this view is the advertised full-fidelity "expand everything" transcript
-        // Thinking entries render zero rows while the `[ui]` show_thinking_blocks toggle is off, so they were silently omitted here
-        // The toggle is thread-local; restore it before returning to live rendering on this same thread
-        //
-        // Scope caveat: with the setting off, the tracker drops reasoning at INGESTION (`handle_thought_chunk` returns before pushing)
-        // That is a deliberate, test-encoded memory tradeoff that predates minimal
-        // Sessions run entirely with the toggle off have no thinking entries for any view to show
-        // This override covers the sessions that do: toggle on at ingestion (the default), or toggled off mid-session
+        // Show every thinking entry THAT EXISTS in the session: this view is the advertised full-fidelity "expand
+        // everything" transcript. That is a deliberate, test-encoded memory tradeoff that predates minimal. Sessions run
+        // entirely with the toggle off have no thinking entries for any view to show.
         let prev_thinking = xai_grok_pager::appearance::cache::load_show_thinking_blocks();
         xai_grok_pager::appearance::cache::set_show_thinking_blocks(true);
         let start = Instant::now();
         while build.next < build.ids.len() {
-            let eid = build.ids[build.next];
+            let Some(&eid) = build.ids.get(build.next) else {
+                break;
+            };
             build.next += 1;
             // Re-resolve by id: entries removed mid-build (rewind / clear) are skipped rather than skewing positions
             if let Some(entry) = sb.index_of_id(eid).and_then(|idx| sb.entry(idx)) {
@@ -201,12 +192,9 @@ fn buffer_to_ansi(buf: &Buffer, out: &mut String) {
     }
 }
 
-/// Build a full SGR sequence (leading reset, then modifiers, fg, bg) for a cell's style.
-/// The caller emits it only when the style changes, so the reset can't leak attributes across cells.
-///
-/// Writes into `sgr` (cleared first) instead of allocating.
-/// This runs once per style *run*, which in syntax-highlighted code is nearly once per token.
-/// The `Vec<String>` and `join` version dominated the serializer's profile on long transcripts.
+/// Build a full SGR sequence (leading reset, then modifiers, fg, bg) for a cell's style. The caller emits it only
+/// when the style changes, so the reset can't leak attributes across cells. Writes into `sgr` (cleared first)
+/// instead of allocating.
 fn cell_sgr(fg: Color, bg: Color, modifier: Modifier, sgr: &mut String) {
     use std::fmt::Write as _;
 
@@ -433,17 +421,19 @@ mod tests {
         buffer_to_ansi(&buf, &mut out);
         let lines: Vec<&str> = out.split('\n').collect();
         // Row 0 has content ending in a reset; row 1 is blank; trailing newline.
-        assert!(lines[0].contains('h') && lines[0].contains('i'));
-        assert!(
-            lines[0].ends_with("\x1b[0m"),
-            "row must reset: {:?}",
-            lines[0]
+        let Some(row0) = lines.first() else {
+            panic!("expected a rendered row: {lines:?}");
+        };
+        assert!(row0.contains('h') && row0.contains('i'));
+        assert!(row0.ends_with("\x1b[0m"), "row must reset: {row0:?}");
+        assert_eq!(
+            lines.get(1).copied(),
+            Some(""),
+            "blank row emits nothing but the newline"
         );
-        assert_eq!(lines[1], "", "blank row emits nothing but the newline");
         assert!(
-            !lines[0].contains("  "),
-            "trailing spaces not trimmed: {:?}",
-            lines[0]
+            !row0.contains("  "),
+            "trailing spaces not trimmed: {row0:?}"
         );
     }
 }

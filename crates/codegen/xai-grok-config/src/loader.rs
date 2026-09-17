@@ -176,8 +176,19 @@ pub fn managed_config_layers_at(
 /// A hook's origin (held by `xai_grok_hooks::HookSpec::layer`).
 /// Defined here, not in `xai-grok-hooks`, since the dep direction is `xai-grok-hooks -> xai-grok-config`.
 /// This crate sets the config tiers; `File`/`Plugin` are set downstream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::AsRefStr,
+    strum::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum HookProvenance {
     /// `/etc/grok/managed_config.toml` (root-owned).
     SystemManaged,
@@ -210,13 +221,11 @@ impl HookProvenance {
     /// Root-owned admin policy tiers; the user cannot disable or skip their hooks.
     /// Every disable path must consult this predicate rather than re-derive the rule from names or paths.
     /// `$GROK_HOME` tiers (`Managed`, `UserRequirements`) never qualify: the user owns that directory and can rewrite or repoint it.
-    /// Exempting them would let any file the user edits grant itself the exemption.
     pub fn is_managed_policy(self) -> bool {
         matches!(self, Self::SystemManaged | Self::Requirements)
     }
 
     /// Authority rank for duplicate resolution: when byte-identical hooks arrive from several tiers, the highest-ranked copy keeps its provenance.
-    /// The provenance carries the no-disable rule and the pinned timeout/env; root-owned tiers outrank `$GROK_HOME` tiers.
     /// Deliberately NOT the config-merge precedence (where user overrides managed).
     /// Merge precedence answers "whose VALUE wins"; this answers "whose copy of one identical hook is authoritative": ownership, not recency.
     pub fn authority_rank(self) -> u8 {
@@ -230,26 +239,12 @@ impl HookProvenance {
             Self::Unknown => 0,
         }
     }
-
-    /// The snake_case wire string (matches the derived serde representation).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SystemManaged => "system_managed",
-            Self::Managed => "managed",
-            Self::Requirements => "requirements",
-            Self::UserRequirements => "user_requirements",
-            Self::User => "user",
-            Self::File => "file",
-            Self::Plugin => "plugin",
-            Self::Unknown => "unknown",
-        }
-    }
 }
 
 impl std::str::FromStr for HookProvenance {
     type Err = std::convert::Infallible;
 
-    /// Inverse of [`HookProvenance::as_str`].
+    /// Inverse of [`HookProvenance`]'s strum string.
     /// Unrecognized strings map to [`HookProvenance::Unknown`] (forward-tolerant), so this never fails.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
@@ -315,7 +310,6 @@ impl HookConfigLayer {
 /// All config-layer `hooks` blocks, highest authority first (matching [`effective_config_base`]).
 /// Read WITHOUT env-expansion and never merged (hooks combine additively downstream).
 /// Absent or unparsable layers are skipped with a warning so one bad layer can't drop the others.
-/// macOS MDM is excluded (not a TOML file).
 pub fn hook_config_layers() -> Vec<HookConfigLayer> {
     hook_config_layers_at(system_config_dir().as_deref(), user_grok_home().as_deref())
 }
@@ -461,14 +455,8 @@ pub fn apply_version_overrides_with_registered(value: &mut toml::Value) -> std::
 }
 
 /// Normalize a single config layer in place, before it is merged with the others.
-///
-/// Currently: couple `[toolset.web_search]`'s mutually-exclusive `allowed_domains` and `excluded_domains`.
-/// If exactly one is set (non-empty), clear the other to `[]`, so the two keys travel together.
 /// `deep_merge_toml` then replaces the whole policy from the winning layer instead of mixing keys across layers.
-/// Both-set (a user error) and both-unset are left alone; the both-set case is handled downstream where the section is read.
-///
 /// This runs on every input of the merge, not only the disk layers.
-/// Campaign and version-override patches overlay *after* the layer merge, so they are normalized too, in `apply_patches`.
 pub(crate) fn normalize_config_layer(layer: &mut toml::Value) {
     let Some(web_search) = layer
         .as_table_mut()
@@ -579,12 +567,20 @@ mod tests {
         // Highest authority first, each layer keeping its own provenance.
         let names: Vec<_> = layers.iter().map(|l| l.source_name().to_string()).collect();
         assert_eq!(names, vec!["requirements/system", "user", "managed"]);
-        assert_eq!(layers[1].provenance(), HookProvenance::User);
+        let Some(user_layer) = layers.get(1) else {
+            panic!("expected user hook layer at index 1: {names:?}");
+        };
+        assert_eq!(user_layer.provenance(), HookProvenance::User);
         // Unmerged, and `${HOME}` stays literal (the runner expands, not the loader).
-        let cmd = layers[1].hooks()["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
-        assert_eq!(cmd, "${HOME}/u.sh");
+        let cmd = user_layer
+            .hooks()
+            .get("PreToolUse")
+            .and_then(|v| v.get(0))
+            .and_then(|v| v.get("hooks"))
+            .and_then(|v| v.get(0))
+            .and_then(|v| v.get("command"))
+            .and_then(toml::Value::as_str);
+        assert_eq!(cmd, Some("${HOME}/u.sh"));
     }
 
     /// The user-writable `$GROK_HOME/requirements.toml` stamps `UserRequirements`, never the exempt `Requirements`.
@@ -599,9 +595,12 @@ mod tests {
         .unwrap();
         let layers = hook_config_layers_at(None, Some(user_home.path()));
         assert_eq!(layers.len(), 1);
-        assert_eq!(layers[0].provenance(), HookProvenance::UserRequirements);
-        assert_eq!(layers[0].source_name(), "requirements/user");
-        assert!(!layers[0].provenance().is_managed_policy());
+        let Some(layer) = layers.first() else {
+            panic!("expected user requirements layer: {layers:?}");
+        };
+        assert_eq!(layer.provenance(), HookProvenance::UserRequirements);
+        assert_eq!(layer.source_name(), "requirements/user");
+        assert!(!layer.provenance().is_managed_policy());
     }
 
     #[test]
@@ -649,21 +648,34 @@ mod tests {
         deep_merge_toml(&mut base, &overrides);
 
         assert_eq!(
-            base["features"]["telemetry"]["enabled"].as_bool(),
+            base.get("features")
+                .and_then(|f| f.get("telemetry"))
+                .and_then(|t| t.get("enabled"))
+                .and_then(toml::Value::as_bool),
             Some(true)
         );
         assert_eq!(
-            base["features"]["telemetry"]["sample_rate"].as_float(),
+            base.get("features")
+                .and_then(|f| f.get("telemetry"))
+                .and_then(|t| t.get("sample_rate"))
+                .and_then(toml::Value::as_float),
             Some(0.0)
         );
-        let arr: Vec<_> = base["server"]["allowed"]
-            .as_array()
-            .unwrap()
-            .iter()
+        let arr: Vec<_> = base
+            .get("server")
+            .and_then(|s| s.get("allowed"))
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(arr, vec!["c"]);
-        assert_eq!(base["brand_new"]["x"].as_integer(), Some(1));
+        assert_eq!(
+            base.get("brand_new")
+                .and_then(|b| b.get("x"))
+                .and_then(toml::Value::as_integer),
+            Some(1)
+        );
     }
 
     fn ws_layer(body: &str) -> toml::Value {
@@ -782,7 +794,12 @@ mod tests {
         )
         .unwrap();
         apply_version_overrides(&mut user, &cli_version).unwrap();
-        assert_eq!(user["telemetry"]["mode"].as_str(), Some("enabled"));
+        assert_eq!(
+            user.get("telemetry")
+                .and_then(|t| t.get("mode"))
+                .and_then(toml::Value::as_str),
+            Some("enabled")
+        );
 
         let requirements: toml::Value = toml::from_str(
             r#"
@@ -794,7 +811,13 @@ mod tests {
 
         let mut merged = user;
         deep_merge_toml(&mut merged, &requirements);
-        assert_eq!(merged["telemetry"]["mode"].as_str(), Some("disabled"));
+        assert_eq!(
+            merged
+                .get("telemetry")
+                .and_then(|t| t.get("mode"))
+                .and_then(toml::Value::as_str),
+            Some("disabled")
+        );
     }
 
     #[test]
@@ -824,7 +847,12 @@ mod tests {
         writeln!(f, "[telemetry]\nmode = \"from_file\"\n").unwrap();
 
         let v = load_user_config_layer(Some(&dir), "config.toml").unwrap();
-        assert_eq!(v["telemetry"]["mode"].as_str(), Some("from_file"));
+        assert_eq!(
+            v.get("telemetry")
+                .and_then(|t| t.get("mode"))
+                .and_then(toml::Value::as_str),
+            Some("from_file")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -40,14 +40,13 @@ impl SessionActor {
                             from_mode: Some(from_mode.to_owned()),
                         },
                     );
-                    tracing::info_span!(
+                    xai_grok_telemetry::event_span!(
                         "session.permission_mode_changed",
                         from_mode = crate::session::telemetry::permission_mode_label(was),
                         to_mode = crate::session::telemetry::permission_mode_label(actual),
                         trigger = "slash_command",
                         enabled = actual,
-                    )
-                    .in_scope(|| {});
+                    );
                 }
                 let status = if actual { "enabled" } else { "disabled" };
                 tracing::info!(
@@ -60,12 +59,26 @@ impl SessionActor {
             }
             BuiltinAction::FlushMemory => {
                 if self.memory.is_enabled() {
-                    let did_flush = self.run_memory_flush("slash_command", None).await;
-                    if !did_flush {
-                        tracing::info!(
-                            session_id = %self.session_info.id.0,
-                            "memory flush skipped via /flush: another flush already in progress",
-                        );
+                    if self.memory.mode() == Some(crate::config::MemoryMode::V2) {
+                        let result = self.flush_v2_capture().await;
+                        if !matches!(
+                            result,
+                            crate::session::memory::v2_capture::FlushResult::Success
+                        ) {
+                            tracing::warn!(
+                                session_id = %self.session_info.id.0,
+                                result = ?result,
+                                "memory-v2 /flush barrier did not complete",
+                            );
+                        }
+                    } else {
+                        let did_flush = self.run_memory_flush("slash_command", None).await;
+                        if !did_flush {
+                            tracing::info!(
+                                session_id = %self.session_info.id.0,
+                                "memory flush skipped via /flush: another flush already in progress",
+                            );
+                        }
                     }
                 } else {
                     tracing::warn!(
@@ -402,7 +415,7 @@ impl SessionActor {
                         }
                     };
                     let path_str = resolved.to_string_lossy().to_string();
-                    match crate::config::add_plugin_path(&path_str) {
+                    match crate::config::run_add_plugin_path(path_str.clone()).await {
                         Ok(()) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::PluginAdded {
@@ -450,7 +463,7 @@ impl SessionActor {
                         }
                     };
                     let path_str = resolved.to_string_lossy().to_string();
-                    match crate::config::remove_plugin_path(&path_str) {
+                    match crate::config::run_remove_plugin_path(path_str.clone()).await {
                         Ok(()) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::PluginRemoved { success: true },
@@ -521,7 +534,24 @@ impl SessionActor {
                         ))
                         .await;
                     } else {
-                        match crate::plugin::install_plugin(&source, cwd) {
+                        // Registry flock (bounded 30s poll) + clone — never on the LocalSet (invariant: plugin/acquire.rs).
+                        let installed = match tokio::task::spawn_blocking({
+                            let source = source.clone();
+                            let cwd = cwd.to_path_buf();
+                            move || crate::plugin::install_plugin(&source, &cwd)
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(e) => {
+                                self.send_host_turn_slash_command_output(&format!(
+                                    "Install task failed: {e}"
+                                ))
+                                .await;
+                                return ok_end_turn(0, None);
+                            }
+                        };
+                        match installed {
                             Ok(outcome) => {
                                 for w in &outcome.warnings {
                                     tracing::warn!("{w}");
@@ -539,14 +569,13 @@ impl SessionActor {
                                         error_category: None,
                                     },
                                 );
-                                tracing::info_span!(
+                                xai_grok_telemetry::event_span!(
                                     "plugin.installed",
                                     success = true,
-                                    install_kind = kind.as_str(),
+                                    install_kind = kind.as_ref(),
                                     plugin_count = outcome.plugin_names.len() as i64,
                                     plugin_name = %outcome.plugin_names.join(","),
-                                )
-                                .in_scope(|| {});
+                                );
                                 self.send_host_turn_slash_command_output(&format!(
                                     "Installed {} plugin(s) from {source}: {}\n\
                                      Run /plugins reload to activate.",
@@ -556,19 +585,18 @@ impl SessionActor {
                                 .await;
                             }
                             Err(e) => {
-                                let error_category = Self::classify_install_error(&e);
+                                let error_category = e.category();
                                 let kind = if crate::plugin::install_source_is_local(&source, cwd) {
                                     xai_grok_telemetry::events::InstallKind::Local
                                 } else {
                                     xai_grok_telemetry::events::InstallKind::Git
                                 };
-                                tracing::info_span!(
+                                xai_grok_telemetry::event_span!(
                                     "plugin.installed",
                                     success = false,
-                                    install_kind = kind.as_str(),
+                                    install_kind = kind.as_ref(),
                                     error_category = %error_category,
-                                )
-                                .in_scope(|| {});
+                                );
                                 xai_grok_telemetry::session_ctx::log_event(
                                     xai_grok_telemetry::events::PluginInstalled {
                                         install_kind: kind,
@@ -596,7 +624,24 @@ impl SessionActor {
                     .await;
                 } else {
                     use crate::plugin::UninstallError;
-                    match crate::plugin::uninstall_plugin(&name, confirm, false) {
+                    // Takes the registry flock + removes directories — never
+                    // on the LocalSet (invariant: plugin/acquire.rs).
+                    let uninstalled = match tokio::task::spawn_blocking({
+                        let name = name.clone();
+                        move || crate::plugin::uninstall_plugin(&name, confirm, false)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            self.send_host_turn_slash_command_output(&format!(
+                                "Uninstall task failed: {e}"
+                            ))
+                            .await;
+                            return ok_end_turn(0, None);
+                        }
+                    };
+                    match uninstalled {
                         Ok(outcome) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::PluginUninstalled {
@@ -639,6 +684,16 @@ impl SessionActor {
                             ))
                             .await;
                         }
+                        Err(UninstallError::RegistryLock { detail }) => {
+                            self.send_host_turn_slash_command_output(&format!(
+                                "Another plugin operation is in progress: {detail}"
+                            ))
+                            .await;
+                        }
+                        Err(e @ UninstallError::RegistrySave { .. }) => {
+                            self.send_host_turn_slash_command_output(&e.to_string())
+                                .await;
+                        }
                     }
                 }
                 ok_end_turn(0, None)
@@ -646,14 +701,30 @@ impl SessionActor {
             BuiltinAction::PluginsUpdate { name } => {
                 use crate::plugin::RepoUpdateOutcome;
 
-                match crate::plugin::update_plugins(name.as_deref()) {
+                // Sync git fetches never run on the session actor's LocalSet
+                // (invariant: plugin/acquire.rs).
+                let update_result = match tokio::task::spawn_blocking(move || {
+                    crate::plugin::update_plugins(name.as_deref())
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        self.send_host_turn_slash_command_output(&format!(
+                            "Plugin update task failed: {e}"
+                        ))
+                        .await;
+                        return ok_end_turn(0, None);
+                    }
+                };
+                match update_result {
                     Ok(outcomes) if outcomes.is_empty() => {
                         self.send_host_turn_slash_command_output("No installed plugins to update.")
                             .await;
                     }
                     Ok(outcomes) => {
                         fn short(c: Option<&str>) -> &str {
-                            c.map(|s| &s[..7.min(s.len())]).unwrap_or("?")
+                            c.and_then(|s| s.get(..7.min(s.len()))).unwrap_or("?")
                         }
                         let messages: Vec<String> = outcomes
                             .iter()
@@ -690,7 +761,13 @@ impl SessionActor {
                 ok_end_turn(0, None)
             }
             BuiltinAction::Feedback { text } => self.execute_feedback_command(text).await,
+            BuiltinAction::MemoryStatus => {
+                let status = self.memory_v2_status().await;
+                self.send_host_turn_slash_command_output(&status).await;
+                ok_end_turn(0, None)
+            }
             BuiltinAction::MemoryBrowse => {
+                let disabled_reason = self.memory.disabled_reason();
                 let file_infos = if let Some(ref storage) = *self.memory.storage.borrow() {
                     match storage.list_memory_files() {
                         Ok(files) => files
@@ -707,8 +784,12 @@ impl SessionActor {
                                         None
                                     }
                                 };
+                                let generated = storage.mode().is_v2()
+                                    && (path == storage.global_memory_file()
+                                        || path == storage.workspace_memory_file());
                                 crate::extensions::notification::MemoryFileInfo {
                                     source: storage.classify_source(&path).to_string(),
+                                    generated,
                                     path: path.display().to_string(),
                                     size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
                                     modified_epoch_secs: meta
@@ -728,23 +809,37 @@ impl SessionActor {
                                 "Failed to list memory files: {e}"
                             ))
                             .await;
-                            vec![]
+                            // No modal: an empty list would render as a fresh store.
+                            return ok_end_turn(0, None);
                         }
                     }
                 } else {
-                    self.send_host_turn_slash_command_output(
-                        "Memory is not enabled for this session.",
-                    )
-                    .await;
+                    // The modal renders the disabled state (with the turn-on hint) itself.
                     vec![]
                 };
+                // Legacy saves at compaction/session end when `save_on_end`; its `/dream` is always available.
+                let v2 = &self.memory.v2_config;
+                let (capture_enabled, dream_enabled) =
+                    if self.memory.mode() == Some(crate::config::MemoryMode::V2) {
+                        (v2.capture_enabled, v2.manual_dream_enabled)
+                    } else {
+                        (self.memory.save_on_end, true)
+                    };
                 tracing::info!(
                     session_id = %self.session_info.id.0,
                     file_count = file_infos.len(),
+                    enabled = disabled_reason.is_none(),
+                    ?disabled_reason,
                     "memory browse: listing files",
                 );
-                self.send_xai_notification(XaiSessionUpdate::MemoryFiles { files: file_infos })
-                    .await;
+                self.send_xai_notification(XaiSessionUpdate::MemoryFiles {
+                    files: file_infos,
+                    enabled: disabled_reason.is_none(),
+                    disabled_reason,
+                    capture_enabled,
+                    dream_enabled,
+                })
+                .await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::MemoryToggle { enabled } => {
@@ -753,16 +848,28 @@ impl SessionActor {
                     enabled,
                     "memory toggle via /memory slash command",
                 );
+                use crate::extensions::notification::MemoryDisabledReason as Reason;
                 let msg = if enabled && !self.memory.is_enabled() {
-                    if let Some(ref params) = self.memory.backend_params {
-                        let storage = crate::session::memory::MemoryStorage::new(
-                            std::path::Path::new(&self.session_info.cwd),
-                            None,
-                        );
-                        if let Err(e) = storage.ensure_initialized() {
+                    match (
+                        self.memory.disabled_reason(),
+                        self.memory.configured_storage.clone(),
+                    ) {
+                        (Some(Reason::RolloutRestricted), _) => {
+                            "Memory v2 cannot be enabled because this session's pinned rollout controls disable it."
+                                .to_owned()
+                        }
+                        (Some(Reason::SessionToggle), Some(storage)) => {
+                        if let Err(e) =
+                            crate::session::memory_state::initialize_memory_storage(storage.clone())
+                                .await
+                        {
                             tracing::warn!(error = %e, "failed to initialize memory storage on re-enable");
                             format!("Memory could not be enabled: {e}")
-                        } else {
+                        } else if self.memory.mode() == Some(crate::config::MemoryMode::V2) {
+                            *self.memory.storage.borrow_mut() = Some(storage);
+                            self.resume_v2_capture().await;
+                            "Memory v2 enabled for this session.".to_owned()
+                        } else if let Some(ref params) = self.memory.backend_params {
                             let backend =
                                 crate::session::memory::MemoryBackendImpl::from_session_params(
                                     storage.clone(),
@@ -780,11 +887,20 @@ impl SessionActor {
                             }
                             *self.memory.storage.borrow_mut() = Some(storage);
                             "Memory enabled for this session.".to_owned()
+                        } else {
+                            "Memory cannot be enabled (legacy backend not configured for this session)."
+                                .to_owned()
                         }
-                    } else {
-                        "Memory cannot be enabled (not configured for this session).".to_owned()
+                        }
+                        _ => {
+                            "Memory cannot be enabled (not configured for this session).".to_owned()
+                        }
                     }
                 } else if !enabled && self.memory.is_enabled() {
+                    if self.memory.mode() == Some(crate::config::MemoryMode::V2) {
+                        self.memory.stop_capture_worker().await;
+                        self.memory.dream_workers.cancel_and_join().await;
+                    }
                     let bridge = self.agent.borrow().tool_bridge().clone();
                     if !bridge.unregister_tool_by_name(
                         xai_grok_tools::implementations::memory::MEMORY_SEARCH_TOOL_NAME,

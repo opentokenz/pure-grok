@@ -80,8 +80,18 @@
         let entry = scrollback.entries_mut().last().expect("entry pushed");
         match &entry.block {
             RenderBlock::System(b) => {
-                assert!(b.text.contains(&notes[0]));
-                assert!(b.text.contains(&notes[1]));
+                assert!(b.text.contains(
+                    notes
+                        .first()
+                        .unwrap_or_else(|| panic!("missing note"))
+                        .as_str()
+                ));
+                assert!(b.text.contains(
+                    notes
+                        .get(1)
+                        .unwrap_or_else(|| panic!("missing note"))
+                        .as_str()
+                ));
                 assert!(
                     b.text.contains('\n'),
                     "expected \\n separator between dropped notes, got: {:?}",
@@ -858,8 +868,7 @@
             .insert(child_sid.into(), make_subagent_info(child_sid));
         let child_view = make_agent(Some(child_sid));
         agent
-            .subagent_views
-            .insert(child_sid.into(), Box::new(child_view));
+            .insert_test_child(child_sid.into(), Box::new(child_view));
 
         let update = XaiSessionUpdate::AutoCompactCompleted {
             tokens_before: Some(90000),
@@ -871,9 +880,9 @@
         assert!(changed);
 
         let info = agent.subagent_sessions.get(child_sid).unwrap();
-        assert_eq!(info.tokens_used, Some(25000));
+        assert_eq!(info.attempt.tokens_used, Some(25000));
         // 25000 tokens of the default 131072 window rounds to 19 percent
-        assert_eq!(info.context_usage_pct, Some(19));
+        assert_eq!(info.attempt.context_usage_pct, Some(19));
 
         // The child view's context_state.used (context-bar numerator) must also be reset; see handle_child_session_notification
         let child_view = agent.subagent_views.get(child_sid).unwrap();
@@ -896,8 +905,7 @@
             90_000, 131_072,
         ));
         agent
-            .subagent_views
-            .insert(child_sid.into(), Box::new(child_view));
+            .insert_test_child(child_sid.into(), Box::new(child_view));
 
         let update = XaiSessionUpdate::AutoCompactStarted {
             tokens_used: 95_000,
@@ -948,8 +956,8 @@
         assert!(!changed);
         // SubagentInfo is still updated for data correctness even though nothing redraws
         let info = agent.subagent_sessions.get(child_sid).unwrap();
-        assert_eq!(info.tokens_used, Some(25000));
-        assert_eq!(info.context_usage_pct, Some(19));
+        assert_eq!(info.attempt.tokens_used, Some(25000));
+        assert_eq!(info.attempt.context_usage_pct, Some(19));
     }
 
     #[test]
@@ -1248,7 +1256,7 @@
             &mut app,
         );
         assert!(changed);
-        let agent = &app.agents[&AgentId(0)];
+        let agent = &app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry"));
         assert_eq!(
             agent.display_name.as_deref(),
             Some("a &amp; b"),
@@ -1271,7 +1279,7 @@
             &mut app,
         ));
         assert_eq!(
-            app.agents[&AgentId(0)]
+            app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry"))
                 .generated_session_title
                 .as_deref(),
             Some("Keep Me"),
@@ -1287,7 +1295,7 @@
             &mut app,
         );
         assert!(changed);
-        let agent = &app.agents[&AgentId(0)];
+        let agent = &app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry"));
         assert!(
             agent.display_name.is_none(),
             "auto titles must not promote to display_name"
@@ -1308,7 +1316,7 @@
             &mut app,
         );
         assert!(changed);
-        let agent = &app.agents[&AgentId(0)];
+        let agent = &app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry"));
         assert_eq!(agent.display_name.as_deref(), Some("Pinned"));
         assert_eq!(agent.generated_session_title.as_deref(), Some("a & b"));
     }
@@ -1329,7 +1337,7 @@
         let raw = serde_json::value::to_raw_value(&n).unwrap();
         let notif = acp::ExtNotification::new("x.ai/session_notification", std::sync::Arc::from(raw));
         assert!(handle_session_notification(&notif, &mut app));
-        let agent = &app.agents[&AgentId(0)];
+        let agent = &app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry"));
         assert!(
             agent.display_name.is_none(),
             "explicit unpin meta must clear display_name"
@@ -1356,7 +1364,7 @@
         let raw = serde_json::value::to_raw_value(&n).unwrap();
         let notif = acp::ExtNotification::new("x.ai/session_notification", std::sync::Arc::from(raw));
         assert!(handle_session_notification(&notif, &mut app));
-        let agent = &app.agents[&AgentId(0)];
+        let agent = &app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry"));
         assert!(
             agent.display_name.is_none(),
             "explicit unpin meta must still clear display_name"
@@ -1385,7 +1393,7 @@
             "{PREFIX}{}",
             "é".repeat(MAX_TITLE_SCALARS - PREFIX.chars().count())
         );
-        let agent = &app.agents[&AgentId(0)];
+        let agent = &app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry"));
         assert!(
             agent.display_name.is_none(),
             "auto titles must not promote to display_name"
@@ -1410,7 +1418,7 @@
             "{PREFIX}{}",
             "é".repeat(MAX_TITLE_SCALARS - PREFIX.chars().count())
         );
-        let agent = &app.agents[&AgentId(0)];
+        let agent = &app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry"));
         assert_eq!(agent.display_name.as_deref(), Some(expected.as_str()));
         assert_eq!(
             agent.generated_session_title.as_deref(),
@@ -1454,9 +1462,7 @@
     }
 
     /// The `HooksChanged` push is the channel late-arriving hooks come through.
-    /// Driven end-to-end through `handle_session_notification`: an empty first
-    /// push must not finish group-collapse seeding, the first non-empty push
-    /// applies the collapsed default, and later pushes preserve expand state.
+    /// Driven end-to-end through `handle_session_notification`: an empty first push must not finish group-collapse seeding, the first non-empty push applies the collapsed default, and later pushes preserve expand state.
     #[test]
     fn hooks_changed_push_seeds_group_collapse_on_first_non_empty_delivery() {
         use crate::views::extensions_modal::{ExtensionsModalState, ExtensionsTab, TabDataState};
@@ -1471,7 +1477,7 @@
             &mut app,
         ));
         {
-            let modal = app.agents[&AgentId(0)].extensions_modal.as_ref().unwrap();
+            let modal = app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).extensions_modal.as_ref().unwrap();
             assert!(matches!(modal.hooks_data, TabDataState::Loaded(_)));
             assert!(
                 modal.hooks_collapsed_groups.is_empty(),
@@ -1486,7 +1492,7 @@
             &mut app,
         ));
         {
-            let modal = app.agents[&AgentId(0)].extensions_modal.as_ref().unwrap();
+            let modal = app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).extensions_modal.as_ref().unwrap();
             assert!(modal.hooks_collapsed_groups.contains("/src1"));
             assert!(modal.hooks_collapsed_groups.contains("/src2"));
         }
@@ -1504,7 +1510,7 @@
             &hooks_changed_ext("sess-1", hooks),
             &mut app,
         ));
-        let modal = app.agents[&AgentId(0)].extensions_modal.as_ref().unwrap();
+        let modal = app.agents.get(&AgentId(0)).unwrap_or_else(|| panic!("missing map entry")).extensions_modal.as_ref().unwrap();
         assert!(!modal.hooks_collapsed_groups.contains("/src1"));
         assert!(modal.hooks_collapsed_groups.contains("/src2"));
     }

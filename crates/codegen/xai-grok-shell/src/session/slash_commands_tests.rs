@@ -17,7 +17,6 @@ fn resolve(
         availability,
         skill_rewrite,
         workflows,
-        LoopFireMode::Detached,
     )
 }
 
@@ -35,7 +34,7 @@ async fn product_skill_infos_none_without_auth() {
 
 #[test]
 fn product_skills_cache_matches_identity_and_team() {
-    use crate::auth::{AuthMode, GrokAuth};
+    use xai_grok_login::{AuthMode, GrokAuth};
     let base = ProductSkillsCacheEntry {
         auth_key: "tok-a".into(),
         user_id: "user-1".into(),
@@ -91,7 +90,7 @@ fn product_skills_cache_matches_identity_and_team() {
 
 #[test]
 fn product_skills_cache_after_untagged_recovery_keeps_primary_tenant() {
-    use crate::auth::{AuthMode, GrokAuth};
+    use xai_grok_login::{AuthMode, GrokAuth};
     let primary = GrokAuth {
         key: "oidc-team".into(),
         user_id: "user-1".into(),
@@ -415,6 +414,32 @@ async fn build_skill_information_for_refs_loads_and_wraps() {
     );
 }
 
+/// The cap runs before substitution, so the truncation note precedes the `**ARGUMENTS:**` suffix.
+#[tokio::test]
+async fn build_skill_information_for_refs_caps_oversized_body() {
+    let body = (1..=1100)
+        .map(|n| format!("{n:05} {}", "x".repeat(194)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("SKILL.md");
+    std::fs::write(&path, body).unwrap();
+
+    let mut skill = make_skill("big", true);
+    skill.path = path.to_string_lossy().to_string();
+    let skills = vec![skill];
+
+    let parsed =
+        parse_skill_references("/big go", &skills, all_gated()).expect("known skill must parse");
+    let info = build_skill_information_for_refs(&parsed, &skills, "sid-1")
+        .await
+        .expect("skill body must load");
+    assert!(!info.contains("01100 "));
+    let note_at = info.find("offset").expect("truncation note");
+    let args_at = info.find("**ARGUMENTS:** go").expect("args suffix");
+    assert!(note_at < args_at);
+}
+
 #[test]
 fn resolve_loop_annotates_block_with_compact_display_text() {
     let outcome = resolve(
@@ -477,36 +502,6 @@ fn resolve_loop_without_args_uses_bare_command_display_text() {
             .and_then(|m| m.get("displayText"))
             .and_then(|v| v.as_str()),
         Some("/loop")
-    );
-}
-
-#[test]
-fn resolve_loop_expands_for_the_sessions_fire_mode() {
-    let text_of = |mode| {
-        let outcome = super::resolve_human_intent(
-            vec![text_block("/loop 1m echo hello")],
-            &[],
-            all_gated(),
-            SkillSlashRewrite::default(),
-            &[],
-            mode,
-        )
-        .unwrap_err();
-        let SlashCommandOutcome::InvokeSkill { blocks, .. } = outcome else {
-            panic!("expected InvokeSkill for /loop");
-        };
-        let Some(acp::ContentBlock::Text(tb)) = blocks.into_iter().next() else {
-            panic!("expected a text block");
-        };
-        tb.text
-    };
-    assert!(
-        text_of(LoopFireMode::Detached).contains("cannot see this conversation"),
-        "detached sessions must get the standalone-prompt framing"
-    );
-    assert!(
-        text_of(LoopFireMode::InSession).contains("arrives as a new turn in this conversation"),
-        "in-session sessions must get the standing-order framing"
     );
 }
 
@@ -757,8 +752,8 @@ fn loop_does_not_resolve_when_scheduler_unavailable() {
     );
 }
 
-fn loop_text(args: &str, mode: LoopFireMode) -> String {
-    match build_loop_prompt_blocks(args, mode).into_iter().next() {
+fn loop_text(args: &str) -> String {
+    match build_loop_prompt_blocks(args).into_iter().next() {
         Some(acp::ContentBlock::Text(t)) => t.text,
         other => panic!("expected a text block, got {other:?}"),
     }
@@ -766,7 +761,7 @@ fn loop_text(args: &str, mode: LoopFireMode) -> String {
 
 #[test]
 fn loop_usage_has_no_10m_default() {
-    let usage = loop_text("", LoopFireMode::Detached);
+    let usage = loop_text("");
     assert!(usage.contains("Usage: /loop"), "got: {usage}");
     assert!(
         !usage.contains("10m"),
@@ -776,7 +771,7 @@ fn loop_usage_has_no_10m_default() {
 
 #[test]
 fn loop_instruction_derives_interval_without_default_or_inline_execute() {
-    let instr = loop_text("every 30 minutes do x", LoopFireMode::Detached);
+    let instr = loop_text("every 30 minutes do x");
     assert!(
         !instr.contains("10m"),
         "instruction must not default: {instr}"
@@ -793,13 +788,11 @@ fn loop_prompt_matches_pager_wording() {
     use xai_grok_tools::implementations::grok_build::{
         loop_schedule_instruction, loop_usage_message,
     };
-    assert_eq!(loop_text("", LoopFireMode::Detached), loop_usage_message());
-    for mode in [LoopFireMode::Detached, LoopFireMode::InSession] {
-        assert_eq!(
-            loop_text("2h run tests", mode),
-            loop_schedule_instruction("2h run tests", mode)
-        );
-    }
+    assert_eq!(loop_text(""), loop_usage_message());
+    assert_eq!(
+        loop_text("2h run tests"),
+        loop_schedule_instruction("2h run tests")
+    );
 }
 
 #[test]
@@ -1463,10 +1456,7 @@ fn default_availability_is_fail_closed_on_every_gate() {
     }
 }
 
-/// `/flush` is a memory-write that's only useful when the model can later read back what it wrote.
-/// The shell's `build_command_availability()` ANDs `memory.is_enabled()` with `memory_search`/`memory_get` registration.
-/// The gate itself just reads `availability.memory`.
-/// Lock both halves so a future change to either side is forced through this test.
+/// `/flush` and `/dream` share the memory availability gate.
 #[test]
 fn flush_hidden_when_memory_gate_off_visible_when_on() {
     let off = advertised_names_with(CommandAvailability::default());
@@ -1493,10 +1483,14 @@ fn memory_bare_resolves_to_browse() {
         resolve_builtin("memory", ""),
         Some(BuiltinAction::MemoryBrowse)
     ));
-    // Any unrecognized arg also falls through to browse
+    // Any unrecognized arg still falls through to the legacy browser.
+    assert!(matches!(
+        resolve_builtin("memory", "unknown"),
+        Some(BuiltinAction::MemoryBrowse)
+    ));
     assert!(matches!(
         resolve_builtin("memory", "status"),
-        Some(BuiltinAction::MemoryBrowse)
+        Some(BuiltinAction::MemoryStatus)
     ));
 }
 
@@ -1600,18 +1594,22 @@ fn memory_not_resolved_when_not_configured() {
 fn parse_skill_refs_single_skill() {
     let skills = vec![make_skill("commit", true)];
     let refs = parse_skill_references("/commit fix typo", &skills, all_gated()).unwrap();
-    assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].name, "commit");
-    assert_eq!(refs[0].args, "fix typo");
+    let [r0] = refs.as_slice() else {
+        panic!("expected one skill ref: {refs:?}");
+    };
+    assert_eq!(r0.name, "commit");
+    assert_eq!(r0.args, "fix typo");
 }
 
 #[test]
 fn parse_skill_refs_single_no_args() {
     let skills = vec![make_skill("commit", true)];
     let refs = parse_skill_references("/commit", &skills, all_gated()).unwrap();
-    assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].name, "commit");
-    assert_eq!(refs[0].args, "");
+    let [r0] = refs.as_slice() else {
+        panic!("expected one skill ref: {refs:?}");
+    };
+    assert_eq!(r0.name, "commit");
+    assert_eq!(r0.args, "");
 }
 
 #[test]
@@ -1619,11 +1617,13 @@ fn parse_skill_refs_multi_skill() {
     let skills = vec![make_skill("review", true), make_skill("lint", true)];
     let refs =
         parse_skill_references("/review fix auth /lint --strict", &skills, all_gated()).unwrap();
-    assert_eq!(refs.len(), 2);
-    assert_eq!(refs[0].name, "review");
-    assert_eq!(refs[0].args, "fix auth");
-    assert_eq!(refs[1].name, "lint");
-    assert_eq!(refs[1].args, "--strict");
+    let [r0, r1] = refs.as_slice() else {
+        panic!("expected two skill refs: {refs:?}");
+    };
+    assert_eq!(r0.name, "review");
+    assert_eq!(r0.args, "fix auth");
+    assert_eq!(r1.name, "lint");
+    assert_eq!(r1.args, "--strict");
 }
 
 #[test]
@@ -1665,10 +1665,12 @@ fn parse_skill_refs_qualified_name() {
         make_scoped_skill("commit", SkillScope::User),
     ];
     let refs = parse_skill_references("/local:commit fix typo", &skills, all_gated()).unwrap();
-    assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].name, "local:commit");
-    assert_eq!(refs[0].args, "fix typo");
-    assert_eq!(refs[0].qualified_name, "local:commit");
+    let [r0] = refs.as_slice() else {
+        panic!("expected one skill ref: {refs:?}");
+    };
+    assert_eq!(r0.name, "local:commit");
+    assert_eq!(r0.args, "fix typo");
+    assert_eq!(r0.qualified_name, "local:commit");
 }
 
 #[test]
@@ -1676,9 +1678,11 @@ fn parse_skill_refs_text_before_first_skill() {
     // Text before the first skill reference is part of user query, not consumed as args
     let skills = vec![make_skill("commit", true)];
     let refs = parse_skill_references("please do /commit fix typo", &skills, all_gated()).unwrap();
-    assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].name, "commit");
-    assert_eq!(refs[0].args, "fix typo");
+    let [r0] = refs.as_slice() else {
+        panic!("expected one skill ref: {refs:?}");
+    };
+    assert_eq!(r0.name, "commit");
+    assert_eq!(r0.args, "fix typo");
 }
 
 // ── /goal command resolution ─────────────────────────────────
@@ -1720,8 +1724,9 @@ fn same_named_builtin_projects_workflow_metadata_without_replacing_command() {
         .iter()
         .filter(|command| command.name == "deep-research")
         .collect();
-    assert_eq!(matching.len(), 1);
-    let command = matching[0];
+    let [command] = matching.as_slice() else {
+        panic!("expected one matching command: {matching:?}");
+    };
     assert_eq!(
         command.description,
         "Research with bounded parallel agents, cross-check evidence, and write a cited report"

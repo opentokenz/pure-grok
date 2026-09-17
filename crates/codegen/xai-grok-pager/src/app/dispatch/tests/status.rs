@@ -5,8 +5,6 @@ use super::*;
 /// Regression for the leader-mode turn-end race: this client is briefly Idle while the server still has queued prompts.
 /// Idle here means `is_turn_running() == false` with `current_prompt_id` cleared; the server's queue is visible as a non-empty `shared_queue` mirror.
 /// A newly-sent prompt must route to the server (immediate-send), not drain locally as a phantom running turn.
-/// The failure mode: a `send_route_plain immediate=false is_turn_running=false shared_queue_len=5` path taking `local_drain`.
-/// That left the prompt shown running on the sender while it was actually queued behind the existing entries on the leader and every other client.
 #[test]
 fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
     let mut app = test_app_with_agent();
@@ -37,12 +35,15 @@ fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
         })
         .unwrap_or_else(|| panic!("expected immediate SendPrompt for 'c', got {effects:?}"));
     // The dispatch did not start a local turn or adopt "c" as the running prompt
+    let Some(agent) = app.agents.get(&id) else {
+        panic!("expected agent {id:?}");
+    };
     assert!(
-        !app.agents[&id].session.state.is_turn_running(),
+        !agent.session.state.is_turn_running(),
         "must not promote 'c' to a local running turn"
     );
     assert!(
-        app.agents[&id].session.current_prompt_id.is_none(),
+        agent.session.current_prompt_id.is_none(),
         "must not set current_prompt_id locally for a server-queued prompt"
     );
     // Echoed into the shared queue behind the existing entries (position 3)
@@ -54,16 +55,9 @@ fn send_while_idle_with_nonempty_shared_queue_routes_to_server() {
     assert_eq!(q.last().map(|e| e.text.as_str()), Some("c"));
 }
 
-// ── coding_data_sharing dispatch tests ───
-//
+// coding data sharing dispatch tests
 // The dispatcher mutates optimistically and rolls back on failure, matching the `set_yolo_mode` pattern minus its toasts
-// The surfaces that change this setting show the result themselves. These tests pin the contract:
-//   - Guards (ZDR, non-admin team) toast and short-circuit; they are the only paths that still speak up, because nothing else on screen would
-//   - Idle unchanged opt-in skips the ACP write but still acks (rollout on).
-//   - Optimistic mutation flips `app.coding_data_retention_opt_out` before the Effect is emitted
-//   - `Effect::SetCodingDataSharing` carries `rollback_to_opted_in = previous_value`
-//   - `TaskResult::CodingDataSharingFailed` reverts the optimistic mutation
-//   - `TaskResult::CodingDataSharingUpdated` re-anchors to the server-confirmed value
+// Guards (ZDR, non-admin team) toast and short-circuit; they are the only paths that still speak up, because nothing else on screen would
 
 /// Idle unchanged opt-in skips ACP and still acks.
 /// Already-out is covered by `settings_opt_out_while_already_out_acks_without_write`.
@@ -85,7 +79,11 @@ fn set_coding_data_sharing_unchanged_opt_in_skips_acp_and_acks() {
             .any(|e| matches!(e, Effect::SetCodingDataSharing { .. })),
         "idle unchanged opt-in must NOT write ACP: {effects:?}"
     );
-    assert!(app.agents[&AgentId(0)].toast.is_none());
+    assert!(
+        app.agents
+            .get(&AgentId(0))
+            .is_some_and(|a| a.toast.is_none())
+    );
     assert!(!app.coding_data_retention_opt_out);
     assert!(app.privacy_banner_acked.is_some());
     assert!(!app.privacy_banner_opt_in_inflight);
@@ -239,7 +237,9 @@ fn set_coding_data_sharing_produces_effect_and_optimistic_mutation() {
     assert!(app.privacy_banner_acked.is_none());
     assert!(!app.privacy_banner_opt_in_inflight);
     assert!(
-        app.agents[&AgentId(0)].toast.is_none(),
+        app.agents
+            .get(&AgentId(0))
+            .is_some_and(|a| a.toast.is_none()),
         "changing this setting must not toast — the settings row is the feedback",
     );
 }
@@ -265,7 +265,9 @@ fn coding_data_sharing_updated_re_anchors_state() {
     // State re-anchored (was already true, stays true).
     assert!(app.coding_data_retention_opt_out);
     assert!(
-        app.agents[&AgentId(0)].toast.is_none(),
+        app.agents
+            .get(&AgentId(0))
+            .is_some_and(|a| a.toast.is_none()),
         "server confirmation must not toast",
     );
 }
@@ -368,7 +370,11 @@ fn set_coding_data_sharing_refreshes_open_modal_snapshot() {
     // Verify snapshot reads opted-in.
     let agent_id = AgentId(0);
     {
-        let state = match &app.agents[&agent_id].active_modal {
+        let state = match app
+            .agents
+            .get(&agent_id)
+            .and_then(|a| a.active_modal.as_ref())
+        {
             Some(crate::views::modal::ActiveModal::Settings { state }) => state,
             _ => panic!("expected Settings modal open after OpenSettings dispatch"),
         };
@@ -380,7 +386,11 @@ fn set_coding_data_sharing_refreshes_open_modal_snapshot() {
     // Dispatch the toggle.
     let _ = dispatch(Action::SetCodingDataSharing { opted_in: false }, &mut app);
     // Snapshot now reflects the optimistic mutation.
-    let state = match &app.agents[&agent_id].active_modal {
+    let state = match app
+        .agents
+        .get(&agent_id)
+        .and_then(|a| a.active_modal.as_ref())
+    {
         Some(crate::views::modal::ActiveModal::Settings { state }) => state,
         _ => panic!("Settings modal must still be open after SetCodingDataSharing dispatch"),
     };
@@ -409,7 +419,11 @@ fn coding_data_sharing_failed_refreshes_open_modal_snapshot() {
         }),
         &mut app,
     );
-    let state = match &app.agents[&AgentId(0)].active_modal {
+    let state = match app
+        .agents
+        .get(&AgentId(0))
+        .and_then(|a| a.active_modal.as_ref())
+    {
         Some(crate::views::modal::ActiveModal::Settings { state }) => state,
         _ => panic!("Settings modal must still be open after rollback TaskResult"),
     };
@@ -426,9 +440,11 @@ fn set_coding_data_sharing_is_silent_in_both_directions() {
         app.coding_data_retention_opt_out = opted_in; // a real change either way
         let _ = dispatch(Action::SetCodingDataSharing { opted_in }, &mut app);
         assert!(
-            app.agents[&AgentId(0)].toast.is_none(),
+            app.agents
+                .get(&AgentId(0))
+                .is_some_and(|a| a.toast.is_none()),
             "opted_in={opted_in} must not toast, got {:?}",
-            app.agents[&AgentId(0)].toast,
+            app.agents.get(&AgentId(0)).and_then(|a| a.toast.as_ref()),
         );
     }
 }
@@ -584,8 +600,8 @@ fn set_coding_data_sharing_no_agents_still_emits_effect() {
     assert_eq!(effects.len(), 1, "no-agent path must still emit Effect");
     assert!(
         matches!(
-            &effects[0],
-            Effect::SetCodingDataSharing { opted_in: true, .. }
+            effects.first(),
+            Some(Effect::SetCodingDataSharing { opted_in: true, .. })
         ),
         "changed opt-in must be the ACP write, not an early ack: {effects:?}"
     );
@@ -649,8 +665,8 @@ fn privacy_banner_opt_in_success_acks() {
     let effects = dispatch(Action::PrivacyBannerOptIn, &mut app);
     assert_eq!(effects.len(), 1);
     assert!(matches!(
-        &effects[0],
-        Effect::SetCodingDataSharing { opted_in: true, .. }
+        effects.first(),
+        Some(Effect::SetCodingDataSharing { opted_in: true, .. })
     ));
     assert!(app.privacy_banner_opt_in_inflight);
     assert!(!app.coding_data_retention_opt_out);
@@ -796,7 +812,6 @@ fn privacy_banner_opt_out_acks_now_without_write() {
 
 /// A superseded reply must not touch state.
 /// Settings opt-out is write 1, the user opts in before it lands, and only then does the stale decline answer.
-/// Applying its success (`opted_in: false`) would flip the pager to opted-out while the server holds opted-in.
 /// That claims data isn't retained when it is. Its failure must not toast either.
 #[test]
 fn superseded_coding_data_reply_cannot_clobber_a_newer_write() {
@@ -854,7 +869,9 @@ fn superseded_coding_data_reply_cannot_clobber_a_newer_write() {
             "stale reply must not undo the newer opt-in (failed={stale_failed})"
         );
         assert!(
-            app.agents[&AgentId(0)].toast.is_none(),
+            app.agents
+                .get(&AgentId(0))
+                .is_some_and(|a| a.toast.is_none()),
             "stale reply must not toast — nothing the user is looking at failed"
         );
     }
@@ -1040,12 +1057,14 @@ fn dispatch_rename_session_updates_display_name_locally() {
     let effects = dispatch_rename_session(&mut app, "renamed via slash".into());
     assert_eq!(effects.len(), 1);
     assert_eq!(
-        app.agents[&AgentId(0)].display_name.as_deref(),
+        app.agents
+            .get(&AgentId(0))
+            .and_then(|a| a.display_name.as_deref()),
         Some("renamed via slash"),
         "/rename must also update local display_name cache"
     );
-    match &effects[0] {
-        Effect::RenameSession { kind, .. } => {
+    match effects.first() {
+        Some(Effect::RenameSession { kind, .. }) => {
             assert_eq!(
                 *kind,
                 xai_grok_shell::session::unified_list::SessionKind::Build,
@@ -1062,11 +1081,13 @@ fn dispatch_rename_session_strips_controls_before_display_name_and_effect() {
     let effects =
         dispatch_rename_session(&mut app, "  Hello\u{1b}[31mWorld\u{07}\u{9b}C1  ".into());
     assert_eq!(
-        app.agents[&AgentId(0)].display_name.as_deref(),
+        app.agents
+            .get(&AgentId(0))
+            .and_then(|a| a.display_name.as_deref()),
         Some("Hello[31mWorldC1"),
         "optimistic display_name must match the shell strip (no OSC/CSI/BEL/C1)"
     );
-    match &effects[..] {
+    match effects.as_slice() {
         [Effect::RenameSession { title, .. }] => {
             assert_eq!(title, "Hello[31mWorldC1");
         }
@@ -1080,7 +1101,9 @@ fn dispatch_rename_session_strips_controls_before_display_name_and_effect() {
         "control-only title must not emit RenameSession: {effects:?}"
     );
     assert!(
-        app.agents[&AgentId(0)].display_name.is_none(),
+        app.agents
+            .get(&AgentId(0))
+            .is_some_and(|a| a.display_name.is_none()),
         "control-only title must not paint a blank/dirty display_name"
     );
     assert!(
@@ -1096,7 +1119,7 @@ fn dispatch_rename_session_chat_kind_stamps_kind_chat() {
     agent.chat_kind = true;
     agent.conversation_entry = true;
     let effects = dispatch_rename_session(&mut app, "chat rename".into());
-    match &effects[..] {
+    match effects.as_slice() {
         [Effect::RenameSession { kind, title, .. }] => {
             assert_eq!(title, "chat rename");
             assert_eq!(
@@ -1118,7 +1141,7 @@ fn dispatch_rename_session_sticky_chat_local_build_stays_build() {
     agent.chat_kind = true;
     agent.conversation_entry = false;
     let effects = dispatch_rename_session(&mut app, "local title".into());
-    match &effects[..] {
+    match effects.as_slice() {
         [Effect::RenameSession { kind, title, .. }] => {
             assert_eq!(title, "local title");
             assert_eq!(
@@ -1199,7 +1222,9 @@ fn dispatch_reset_session_title_clears_titles_and_emits_effect() {
         agent.generated_session_title = Some("Manual".into());
     }
     let effects = dispatch_reset_session_title(&mut app);
-    let agent = &app.agents[&AgentId(0)];
+    let Some(agent) = app.agents.get(&AgentId(0)) else {
+        panic!("expected agent 0");
+    };
     assert!(
         agent.display_name.is_none(),
         "optimistic unpin must clear display_name"
@@ -1213,7 +1238,7 @@ fn dispatch_reset_session_title_clears_titles_and_emits_effect() {
         "Manual",
         "dashboard/tab entry_title must not stay the manual pin"
     );
-    match &effects[..] {
+    match effects.as_slice() {
         [
             Effect::ResetSessionTitle {
                 agent_id,
@@ -1247,7 +1272,9 @@ fn dispatch_reset_session_title_never_manual_keeps_generated_title() {
         agent.generated_session_title = Some("Auto".into());
     }
     let effects = dispatch_reset_session_title(&mut app);
-    let agent = &app.agents[&AgentId(0)];
+    let Some(agent) = app.agents.get(&AgentId(0)) else {
+        panic!("expected agent 0");
+    };
     assert!(agent.display_name.is_none());
     assert_eq!(agent.generated_session_title.as_deref(), Some("Auto"));
     assert_eq!(
@@ -1257,7 +1284,7 @@ fn dispatch_reset_session_title_never_manual_keeps_generated_title() {
     );
     assert!(
         matches!(
-            &effects[..],
+            effects.as_slice(),
             [Effect::ResetSessionTitle {
                 kind: xai_grok_shell::session::unified_list::SessionKind::Build,
                 ..
@@ -1279,7 +1306,7 @@ fn dispatch_reset_session_title_sticky_chat_local_build_stays_build() {
         agent.generated_session_title = Some("Auto".into());
     }
     let effects = dispatch_reset_session_title(&mut app);
-    match &effects[..] {
+    match effects.as_slice() {
         [Effect::ResetSessionTitle { kind, .. }] => {
             assert_eq!(
                 *kind,
@@ -1289,9 +1316,15 @@ fn dispatch_reset_session_title_sticky_chat_local_build_stays_build() {
         }
         other => panic!("expected ResetSessionTitle, got {other:?}"),
     }
-    assert!(app.agents[&AgentId(0)].display_name.is_none());
+    assert!(
+        app.agents
+            .get(&AgentId(0))
+            .is_some_and(|a| a.display_name.is_none())
+    );
     assert_eq!(
-        app.agents[&AgentId(0)].generated_session_title.as_deref(),
+        app.agents
+            .get(&AgentId(0))
+            .and_then(|a| a.generated_session_title.as_deref()),
         Some("Auto")
     );
 }
@@ -1306,13 +1339,18 @@ fn dispatch_reset_session_title_refuses_chat_kind() {
         agent.display_name = Some("Chat title".into());
         agent.generated_session_title = Some("Kept".into());
     }
-    let scrollback_len_before = app.agents[&AgentId(0)].scrollback.len();
+    let Some(agent) = app.agents.get(&AgentId(0)) else {
+        panic!("expected agent 0");
+    };
+    let scrollback_len_before = agent.scrollback.len();
     let effects = dispatch_reset_session_title(&mut app);
     assert!(
         effects.is_empty(),
         "chat-kind unpin must not emit an effect, got {effects:?}"
     );
-    let agent = &app.agents[&AgentId(0)];
+    let Some(agent) = app.agents.get(&AgentId(0)) else {
+        panic!("expected agent 0");
+    };
     assert_eq!(agent.display_name.as_deref(), Some("Chat title"));
     assert_eq!(agent.generated_session_title.as_deref(), Some("Kept"));
     assert_eq!(agent.scrollback.len(), scrollback_len_before + 1);
@@ -1353,8 +1391,8 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_bool(
 
     // Recursive dispatch into Action::SetCompactMode(false) emits the persist effect
     assert_eq!(effects.len(), 1);
-    match &effects[0] {
-        Effect::PersistSetting { key, value, .. } => {
+    match effects.first() {
+        Some(Effect::PersistSetting { key, value, .. }) => {
             assert_eq!(*key, "compact_mode");
             assert_eq!(value, &SettingValue::Bool(false));
         }
@@ -1399,8 +1437,8 @@ fn dispatch_confirm_reset_setting_reset_dispatches_typed_setter_for_shared_enum(
 
         // Reset dispatches SetTheme("groknight"), the registered default
         assert_eq!(effects.len(), 1);
-        match &effects[0] {
-            Effect::PersistSetting { key, value, .. } => {
+        match effects.first() {
+            Some(Effect::PersistSetting { key, value, .. }) => {
                 assert_eq!(*key, "theme");
                 assert_eq!(value, &SettingValue::Enum("groknight"));
             }
@@ -1420,7 +1458,10 @@ fn seed_scrolled_up(app: &mut AppView) {
 }
 
 fn current_usage_nonce(app: &AppView) -> u64 {
-    match app.agents[&AgentId(0)].active_modal.as_ref() {
+    let Some(agent) = app.agents.get(&AgentId(0)) else {
+        panic!("expected agent 0");
+    };
+    match agent.active_modal.as_ref() {
         Some(crate::views::modal::ActiveModal::UsageInfo { state }) => state.fetch_nonce,
         _ => 0,
     }
@@ -1519,7 +1560,12 @@ fn session_usage_keeps_scroll_when_page_flip_off() {
     app.usage_visible = false;
     seed_scrolled_up(&mut app);
     complete_session_usage(&mut app);
-    assert_eq!(app.agents[&AgentId(0)].scrollback.scroll_offset(), 0);
+    assert_eq!(
+        app.agents
+            .get(&AgentId(0))
+            .map(|a| a.scrollback.scroll_offset()),
+        Some(0)
+    );
     crate::appearance::cache::set_page_flip_on_send(prev);
 }
 
@@ -1590,7 +1636,11 @@ fn open_tutorial_toggles_overlay_without_effects() {
 // ── Usage modal (full TUI) dispatch tests ────────────────────────────
 
 fn usage_modal_state(app: &AppView) -> &crate::views::usage_modal::UsageInfoModalState {
-    match app.agents[&AgentId(0)].active_modal.as_ref() {
+    match app
+        .agents
+        .get(&AgentId(0))
+        .and_then(|a| a.active_modal.as_ref())
+    {
         Some(crate::views::modal::ActiveModal::UsageInfo { state }) => state,
         _ => panic!("expected the usage modal to be open"),
     }
@@ -1684,7 +1734,10 @@ fn usage_results_populate_open_modal_not_scrollback() {
         .as_ref()
         .expect("session fields populated");
     assert_eq!(fields.len(), 1);
-    assert_eq!(fields[0].value, "test-session");
+    let Some(field) = fields.first() else {
+        panic!("expected a session field: {fields:?}");
+    };
+    assert_eq!(field.value, "test-session");
     assert!(state.context.is_some());
 }
 

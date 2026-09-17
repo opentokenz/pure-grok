@@ -6,6 +6,13 @@ use crate::app::agent::AgentState;
 use crate::app::agent_view::test_fixtures::simulate_task_output_wait;
 use crate::views::btw_overlay::BtwOverlayState;
 
+fn agent_ref(app: &AppView, id: AgentId) -> &AgentView {
+    let Some(agent) = app.agents.get(&id) else {
+        panic!("expected agent {id:?}");
+    };
+    agent
+}
+
 fn running_turn_app() -> AppView {
     let mut app = test_app_with_agent();
     let agent = app.agents.get_mut(&AgentId(0)).unwrap();
@@ -25,21 +32,25 @@ fn sent_texts(effects: &[Effect]) -> Vec<String> {
         .collect()
 }
 
-/// Forces the local queue path (`FollowUpBehavior::Queue`) so a mid-turn Enter enqueues locally instead of handing the send to the server.
-struct LocalQueueMode {
+/// Forces the local drip-feed send path so a mid-turn Enter enqueues locally instead of handing the send to the server.
+struct LocalFollowUp {
     previous: crate::appearance::FollowUpBehavior,
 }
-impl LocalQueueMode {
-    fn enter(app: &mut AppView) -> Self {
+impl LocalFollowUp {
+    fn enter(app: &mut AppView, behavior: crate::appearance::FollowUpBehavior) -> Self {
         app.leader_mode = false;
         let previous = crate::appearance::cache::load_follow_up_behavior();
-        crate::appearance::cache::set_follow_up_behavior(
-            crate::appearance::FollowUpBehavior::Queue,
-        );
+        crate::appearance::cache::set_follow_up_behavior(behavior);
         Self { previous }
     }
+    fn queue(app: &mut AppView) -> Self {
+        Self::enter(app, crate::appearance::FollowUpBehavior::Queue)
+    }
+    fn steer(app: &mut AppView) -> Self {
+        Self::enter(app, crate::appearance::FollowUpBehavior::Steer)
+    }
 }
-impl Drop for LocalQueueMode {
+impl Drop for LocalFollowUp {
     fn drop(&mut self) {
         crate::appearance::cache::set_follow_up_behavior(self.previous);
     }
@@ -49,7 +60,8 @@ impl Drop for LocalQueueMode {
 #[test]
 fn send_while_waiting_goes_through_when_btw_overlay_is_open() {
     let mut app = running_turn_app();
-    let _mode = LocalQueueMode::enter(&mut app);
+    let _mode = LocalFollowUp::steer(&mut app);
+    enqueue_local(&mut app, AgentId(0), "held");
     {
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         simulate_task_output_wait(agent, "task-1");
@@ -64,12 +76,17 @@ fn send_while_waiting_goes_through_when_btw_overlay_is_open() {
     let effects = dispatch_send_prompt(&mut app, "keep going".into());
 
     assert_eq!(sent_texts(&effects), vec!["keep going".to_string()]);
-    assert!(
-        app.agents[&AgentId(0)].session.pending_prompts.is_empty(),
-        "an open /btw overlay must not leave the send queued",
+    assert_eq!(
+        agent_ref(&app, AgentId(0))
+            .session
+            .pending_prompts
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["held"]
     );
     assert!(
-        app.agents[&AgentId(0)].btw_state.is_some(),
+        agent_ref(&app, AgentId(0)).btw_state.is_some(),
         "releasing the send must not dismiss the /btw overlay",
     );
 }
@@ -90,6 +107,7 @@ fn btw_response_does_not_flush_an_unrelated_queued_prompt() {
 
     let effects = dispatch_task_result(
         TaskResult::BtwResponse {
+            image_notice: None,
             agent_id: AgentId(0),
             result: Ok("still waiting".into()),
             minimal_request_id: None,
@@ -102,7 +120,7 @@ fn btw_response_does_not_flush_an_unrelated_queued_prompt() {
         "btw completion must not interject a pre-queued follow-up, got {effects:?}"
     );
     assert_eq!(
-        app.agents[&AgentId(0)]
+        agent_ref(&app, AgentId(0))
             .session
             .pending_prompts
             .front()
@@ -111,10 +129,38 @@ fn btw_response_does_not_flush_an_unrelated_queued_prompt() {
     );
     assert!(
         matches!(
-            app.agents[&AgentId(0)].btw_state,
+            agent_ref(&app, AgentId(0)).btw_state,
             Some(BtwOverlayState::Done { .. })
         ),
         "the overlay must still show the answer",
+    );
+}
+
+#[test]
+fn queue_mode_send_while_waiting_stays_queued() {
+    let mut app = running_turn_app();
+    let _mode = LocalFollowUp::queue(&mut app);
+    enqueue_local(&mut app, AgentId(0), "queued while thinking");
+    {
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        simulate_task_output_wait(agent, "task-1");
+        assert!(agent.is_parked_on_sendable_wait());
+    }
+
+    let effects = dispatch_send_prompt(&mut app, "just typed".into());
+
+    assert!(
+        sent_texts(&effects).is_empty(),
+        "Queue must not interject during a wait, got {effects:?}"
+    );
+    assert_eq!(
+        agent_ref(&app, AgentId(0))
+            .session
+            .pending_prompts
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["queued while thinking", "just typed"]
     );
 }
 
@@ -122,7 +168,7 @@ fn btw_response_does_not_flush_an_unrelated_queued_prompt() {
 #[test]
 fn send_while_waiting_releases_the_new_prompt_not_an_older_queued_row() {
     let mut app = running_turn_app();
-    let _mode = LocalQueueMode::enter(&mut app);
+    let _mode = LocalFollowUp::steer(&mut app);
     enqueue_local(&mut app, AgentId(0), "queued while thinking");
     {
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
@@ -134,7 +180,7 @@ fn send_while_waiting_releases_the_new_prompt_not_an_older_queued_row() {
 
     assert_eq!(sent_texts(&effects), vec!["just typed".to_string()]);
     assert_eq!(
-        app.agents[&AgentId(0)]
+        agent_ref(&app, AgentId(0))
             .session
             .pending_prompts
             .iter()
@@ -144,11 +190,38 @@ fn send_while_waiting_releases_the_new_prompt_not_an_older_queued_row() {
     );
 }
 
+#[test]
+fn queue_mode_send_while_waiting_with_empty_queue_stays_queued() {
+    let mut app = running_turn_app();
+    let _mode = LocalFollowUp::queue(&mut app);
+    {
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        simulate_task_output_wait(agent, "task-1");
+        assert!(agent.is_parked_on_sendable_wait());
+    }
+
+    let effects = dispatch_send_prompt(&mut app, "just typed".into());
+
+    assert!(
+        sent_texts(&effects).is_empty(),
+        "Queue must not wait-interject even with an empty pile, got {effects:?}"
+    );
+    assert_eq!(
+        agent_ref(&app, AgentId(0))
+            .session
+            .pending_prompts
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["just typed"]
+    );
+}
+
 /// A thinking turn (running, but not parked / watching) still queues.
 #[test]
 fn send_while_thinking_stays_queued() {
     let mut app = running_turn_app();
-    let _mode = LocalQueueMode::enter(&mut app);
+    let _mode = LocalFollowUp::queue(&mut app);
 
     let effects = dispatch_send_prompt(&mut app, "later".into());
 
@@ -156,5 +229,5 @@ fn send_while_thinking_stays_queued() {
         sent_texts(&effects).is_empty(),
         "a thinking turn must not interject, got {effects:?}"
     );
-    assert_eq!(app.agents[&AgentId(0)].session.pending_prompts.len(), 1);
+    assert_eq!(agent_ref(&app, AgentId(0)).session.pending_prompts.len(), 1);
 }

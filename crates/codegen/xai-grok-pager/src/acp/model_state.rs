@@ -83,10 +83,9 @@ impl ModelState {
             })
     }
 
-    /// Whether the current model accepts image input, read from the model's `meta` (the ACP extension point, same source as `totalContextTokens`).
-    /// Honors an explicit `acceptsImages` bool, else an `inputModalities` array containing `"image"`.
-    /// DEFAULTS TO `true` when neither key is present: all current Grok models accept images, so nothing is suppressed today.
-    /// Once the ACP server populates the key, non-vision models get suppressed.
+    /// Whether the current model accepts image input, read from the model's `meta` (the ACP extension point, same
+    /// source as `totalContextTokens`). Honors an explicit `acceptsImages` bool, else an `inputModalities` array
+    /// containing `"image"`. Once the ACP server populates the key, non-vision models get suppressed.
     pub fn current_model_accepts_images(&self) -> bool {
         let Some(meta) = self
             .current
@@ -365,11 +364,13 @@ mod tests {
             ],
         })));
         let opts = state.reasoning_effort_options();
-        assert_eq!(opts.len(), 2);
-        assert_eq!(opts[0].label, "Balanced");
-        assert_eq!(opts[0].value, ReasoningEffort::Medium);
-        assert_eq!(opts[1].id, "deep");
-        assert_eq!(opts[1].description.as_deref(), Some("Max"));
+        let [first, second] = opts.as_slice() else {
+            panic!("expected 2 options, got {}", opts.len());
+        };
+        assert_eq!(first.label, "Balanced");
+        assert_eq!(first.value, ReasoningEffort::Medium);
+        assert_eq!(second.id, "deep");
+        assert_eq!(second.description.as_deref(), Some("Max"));
     }
 
     #[test]

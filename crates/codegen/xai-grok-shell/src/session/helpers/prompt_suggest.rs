@@ -121,16 +121,15 @@ fn transcript_line(role: &str, text: &str) -> Option<String> {
     let mut text = text;
     if text.len() > MESSAGE_CAP_CHARS {
         let cut = floor_char_boundary(text, MESSAGE_CAP_CHARS);
-        text = &text[..cut];
+        if let Some(prefix) = text.get(..cut) {
+            text = prefix;
+        }
     }
     Some(format!("{role}: {text}"))
 }
 
 /// Keeps genuine `User` messages (skipping runtime-synthesized ones) and `Assistant` text, newest-last.
 /// Walks backwards until the character budget is exhausted.
-/// Tool calls/results, reasoning, and the system prompt are dropped.
-/// The user/assistant dialogue carries the signal for "what will the user type next", and dropping the rest keeps the request cheap.
-///
 /// Returns `None` when the conversation has no assistant reply yet (nothing to predict from).
 pub(crate) fn build_transcript(conversation: &[ConversationItem]) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
@@ -140,7 +139,7 @@ pub(crate) fn build_transcript(conversation: &[ConversationItem]) -> Option<Stri
     for item in conversation.iter().rev() {
         let line = match item {
             ConversationItem::User(u) => {
-                if u.synthetic_reason.is_some() {
+                if !u.synthetic_reason.is_human() {
                     continue;
                 }
                 transcript_line("User", &item.text_content())
@@ -437,7 +436,7 @@ mod tests {
     fn transcript_skips_synthetic_user_messages() {
         let mut synthetic = ConversationItem::user("synthetic reminder".to_owned());
         if let ConversationItem::User(u) = &mut synthetic {
-            u.synthetic_reason = Some(crate::sampling::SyntheticReason::SystemReminder);
+            u.synthetic_reason = crate::sampling::SyntheticReason::SystemReminder;
         }
         let conv = vec![user("real question"), synthetic, assistant("answer")];
         let t = build_transcript(&conv).unwrap();

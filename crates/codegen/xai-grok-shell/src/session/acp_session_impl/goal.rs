@@ -205,7 +205,7 @@ impl SessionActor {
             self.auto_pause_goal_if_active_with_message(
                 crate::session::goal_tracker::GoalPauseReason::Infra,
                 format!(
-                    "Goal verification infrastructure failed ({}). Resume with /goal to retry.",
+                    "Goal verification infrastructure failed ({}). Run /goal resume to retry.",
                     reason.as_const_str()
                 ),
             )
@@ -784,7 +784,11 @@ impl SessionActor {
         )
     }
 
-    pub(super) async fn setup_goal(&self, objective: &str, token_budget: Option<i64>) -> String {
+    pub(super) async fn setup_goal(
+        &self,
+        objective: &str,
+        token_budget: Option<i64>,
+    ) -> GoalSetupOutcome {
         let goal_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339();
         let token_baseline = self.chat_state_handle.get_total_tokens().await as i64;
@@ -817,40 +821,48 @@ impl SessionActor {
         }
 
         self.maybe_run_goal_planner(objective).await;
+        if let Some(msg) = self.planner_pause_short_circuit_message("Goal paused.") {
+            return GoalSetupOutcome::Message(msg);
+        }
 
         let names = self.resolve_goal_tool_names().await;
         let planner_enabled = self.goal_planner_enabled;
         let body = {
             let tracker = self.goal_tracker.lock();
-            let o = tracker
-                .snapshot()
-                .expect("create_goal must populate the orchestration snapshot");
-            let plan_path = goal_reminder_plan_path(planner_enabled, o);
-            let scratch_dir = crate::session::goal_tracker::implementer_scratch_dir(&o.verifier_id);
-            let scratch = scratch_dir.to_string_lossy();
-            if self.goal_runs_on_workflow_engine() {
-                render_goal_rules(
-                    objective,
-                    &names,
-                    "",
-                    "",
-                    plan_path,
-                    &scratch,
-                    o.scratch_dir_ready,
-                )
-            } else {
-                render_goal_rules_legacy(
-                    objective,
-                    &names,
-                    "",
-                    "",
-                    plan_path,
-                    &scratch,
-                    o.scratch_dir_ready,
-                )
-            }
+            tracker.snapshot().map(|o| {
+                let plan_path = goal_reminder_plan_path(planner_enabled, o);
+                let scratch_dir =
+                    crate::session::goal_tracker::implementer_scratch_dir(&o.verifier_id);
+                let scratch = scratch_dir.to_string_lossy();
+                if self.goal_runs_on_workflow_engine() {
+                    render_goal_rules(
+                        objective,
+                        &names,
+                        "",
+                        "",
+                        plan_path,
+                        &scratch,
+                        o.scratch_dir_ready,
+                    )
+                } else {
+                    render_goal_rules_legacy(
+                        objective,
+                        &names,
+                        "",
+                        "",
+                        plan_path,
+                        &scratch,
+                        o.scratch_dir_ready,
+                    )
+                }
+            })
         };
-        format!("<system-reminder>\n{body}\nStart now.\n</system-reminder>\n\n")
+        let Some(body) = body else {
+            return GoalSetupOutcome::Message(GOAL_CLEARED_DURING_PLANNING.to_string());
+        };
+        GoalSetupOutcome::Inference {
+            reminder: format!("<system-reminder>\n{body}\nStart now.\n</system-reminder>\n\n"),
+        }
     }
 
     pub(super) async fn resume_goal(&self) -> GoalResumeOutcome {
@@ -928,6 +940,7 @@ impl SessionActor {
         self.goal_blocked_streak
             .store(0, std::sync::atomic::Ordering::Relaxed);
 
+        let mut planner_published = false;
         if was_resumed {
             let needs_retry = {
                 let tracker = self.goal_tracker.lock();
@@ -944,11 +957,17 @@ impl SessionActor {
                     .map(|o| o.objective.clone());
                 if let Some(objective) = objective {
                     self.maybe_run_goal_planner(&objective).await;
-                    if self.goal_tracker.lock().status() != Some(GoalStatus::Active) {
-                        return GoalResumeOutcome::Message(
-                            "Planning failed again; goal paused.".to_string(),
-                        );
+                    if let Some(msg) = self
+                        .planner_pause_short_circuit_message("Planning failed again; goal paused.")
+                    {
+                        return GoalResumeOutcome::Message(msg);
                     }
+                    // `needs_retry` saw `plan_file == None` and the goal is still Active, so `Some` means this resume published.
+                    planner_published = self
+                        .goal_tracker
+                        .lock()
+                        .snapshot()
+                        .is_some_and(|o| o.plan_file.is_some());
                 }
             }
         }
@@ -975,6 +994,8 @@ impl SessionActor {
                  working. If no, you may block again with an updated reason.\n\
                  \n"
             ),
+            // The pause was the planner's own failure; a plan published on this resume supersedes it.
+            (GoalStatus::InfraPaused, _) if planner_published => String::new(),
             (GoalStatus::InfraPaused, Some(msg)) => format!(
                 "Previous state: Paused (infrastructure error).\n\
                  Previous error: {msg}\n\
@@ -1108,7 +1129,7 @@ impl SessionActor {
             matches!(
                 item,
                 ConversationItem::User(u)
-                    if u.synthetic_reason == Some(SyntheticReason::GoalSummary)
+                    if u.synthetic_reason == SyntheticReason::GoalSummary
             ) && item.text_content().contains(GOAL_CONTINUATION_SENTINEL)
         }
         let conv = self.chat_state_handle.get_conversation().await;
