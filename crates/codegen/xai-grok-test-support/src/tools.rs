@@ -8,6 +8,10 @@ const MCP_NAME_SEPARATOR: &str = "__";
 /// The meta tool the shell offers for MCP dispatch when tool search is on; the model names
 /// the target in its `tool_name`/`tool_input` arguments rather than calling `server__tool` directly.
 const USE_TOOL_NAME: &str = "use_tool";
+/// The subagent spawn tool's name in each toolset: GrokBuild spells it `spawn_subagent`, the
+/// daemon worker spells it `Task`. Single-sourced so the two spellings cannot drift.
+pub const GROK_BUILD_SPAWN_TOOL: &str = "spawn_subagent";
+pub const DAEMON_SPAWN_TOOL: &str = "Task";
 /// The task id a task call gets when the case names none.
 pub(crate) const FIRST_TASK_ID: &str = "1";
 /// The interval a cron call gets when the case names none.
@@ -21,6 +25,8 @@ pub enum Tool {
     Grep,
     Glob,
     List,
+    MemorySearch,
+    MemoryGet,
     Task,
     Skill,
     SendMessage,
@@ -32,10 +38,12 @@ pub enum Tool {
     Todo,
     SearchTool,
     KillTask,
+    Monitor,
     SchedulerCreate,
     SchedulerList,
     SchedulerDelete,
     Workflow,
+    Lsp,
     /// A created task in the cases' vocabulary; becomes one todo write.
     TaskCreate,
     /// A task update in the cases' vocabulary; also one todo write.
@@ -60,6 +68,8 @@ impl fmt::Display for Tool {
             | Tool::Grep
             | Tool::Glob
             | Tool::List
+            | Tool::MemorySearch
+            | Tool::MemoryGet
             | Tool::Task
             | Tool::Skill
             | Tool::SendMessage
@@ -71,10 +81,12 @@ impl fmt::Display for Tool {
             | Tool::Todo
             | Tool::SearchTool
             | Tool::KillTask
+            | Tool::Monitor
             | Tool::SchedulerCreate
             | Tool::SchedulerList
             | Tool::SchedulerDelete
             | Tool::Workflow
+            | Tool::Lsp
             | Tool::TaskCreate
             | Tool::TaskUpdate
             | Tool::CronCreate
@@ -147,7 +159,9 @@ impl Tool {
             Tool::Grep => GrokBuildRow::new("grep"),
             Tool::Glob => GrokBuildRow::new("glob"),
             Tool::List => GrokBuildRow::new("list_dir"),
-            Tool::Task => GrokBuildRow::new("spawn_subagent").with_fills(&[FieldFill {
+            Tool::MemorySearch => GrokBuildRow::new("memory_search"),
+            Tool::MemoryGet => GrokBuildRow::new("memory_get"),
+            Tool::Task => GrokBuildRow::new(GROK_BUILD_SPAWN_TOOL).with_fills(&[FieldFill {
                 field: "description",
                 source: "prompt",
             }]),
@@ -161,10 +175,12 @@ impl Tool {
             Tool::Todo => GrokBuildRow::new("todo_write").with_shape(default_todos_to_pending),
             Tool::SearchTool => GrokBuildRow::new("search_tool"),
             Tool::KillTask => GrokBuildRow::new("kill_command_or_subagent"),
+            Tool::Monitor => GrokBuildRow::new("monitor"),
             Tool::SchedulerCreate => GrokBuildRow::new("scheduler_create"),
             Tool::SchedulerList => GrokBuildRow::new("scheduler_list"),
             Tool::SchedulerDelete => GrokBuildRow::new("scheduler_delete"),
             Tool::Workflow => GrokBuildRow::new("workflow"),
+            Tool::Lsp => GrokBuildRow::new("lsp"),
             Tool::TaskCreate => {
                 GrokBuildRow::new("todo_write").with_shape(todo_write_from_created_task)
             }

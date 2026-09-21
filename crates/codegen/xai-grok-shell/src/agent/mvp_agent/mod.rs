@@ -50,6 +50,7 @@ use xai_grok_sampling_types::{
 };
 use crate::agent::update_chunk_merge;
 use xai_grok_login::AuthManager;
+use xai_grok_login::backend::AuthBackend as _;
 use crate::config::StorageMode;
 use crate::extensions::notification::{SessionNotification, SessionUpdate};
 use xai_grok_telemetry::id::{agent_id, agent_instance_id};
@@ -241,6 +242,7 @@ pub(crate) struct SessionSpawnOptions<'a> {
         crate::session::announcement_state::AnnouncementState,
     >,
     pub session_meta: Option<&'a acp::Meta>,
+    pub persisted_agent_profile: Option<xai_grok_agent::AgentDefinition>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
     /// A `session/new` reasoning-effort hint applied to the spawn sampling; `None` for loads.
@@ -385,6 +387,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         persisted_workflow_runs: Vec::new(),
         persisted_announcement_state: None,
         session_meta,
+        persisted_agent_profile: None,
         model_agent_type,
         session_model_id,
         initial_reasoning_effort: None,
@@ -1077,38 +1080,6 @@ impl AuthRequestMeta {
             .unwrap_or_default()
     }
 }
-/// Every authenticated request to cli-chat-proxy (web search, image gen, and any future tools that go through the proxy) must carry these headers.
-/// Headers injected: `x-grok-client-version`: required by the proxy's version-gate check. Uses `client_version` when provided, otherwise falls back to cli-chat-proxy compile-time `CARGO_PKG_VERSION`.
-/// `X-XAI-Token-Auth` / `x-authenticateresponse`: required by the cli-chat-proxy auth middleware when the `base_url` is a known proxy URL. Existing entries are never overwritten so callers can pre-set a value.
-fn inject_proxy_headers(
-    headers: &mut indexmap::IndexMap<String, String>,
-    client_version: Option<&str>,
-    alpha_test_key: Option<&str>,
-    base_url: &str,
-) {
-    headers
-        .entry("x-grok-client-version".to_string())
-        .or_insert_with(|| {
-            client_version
-                .map(String::from)
-                .unwrap_or_else(|| xai_grok_version::VERSION.to_string())
-        });
-    headers
-        .entry("x-grok-client-identifier".to_string())
-        .or_insert_with(crate::http::process_client_identifier);
-    if crate::util::is_cli_chat_proxy_url(base_url) {
-        headers
-            .entry("X-XAI-Token-Auth".to_string())
-            .or_insert_with(|| "xai-grok-cli".to_string());
-        headers
-            .entry("x-authenticateresponse".to_string())
-            .or_insert_with(|| "authenticate-response".to_string());
-        headers
-            .entry(crate::http::CLIENT_MODE_HEADER.to_string())
-            .or_insert_with(|| crate::http::process_client_mode().to_string());
-    }
-    let _ = (alpha_test_key, base_url);
-}
 fn resolve_inference_idle_timeout_secs(
     models: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
     model: &str,
@@ -1247,6 +1218,7 @@ mod acp_agent;
 pub(crate) mod reasoning_effort;
 mod sampler_prewarm;
 mod session_setup;
+pub use session_setup::SessionSetupPhase;
 mod subagent_spawn;
 pub(crate) mod test_hooks;
 mod turn_end;
@@ -1376,7 +1348,9 @@ impl MvpAgent {
                 output_file: std::path::PathBuf::new(),
                 truncated: false,
                 exit_code: None,
-                signal: Some("session_restart".to_string()),
+                signal: Some(
+                    xai_grok_tools::computer::types::SESSION_RESTART_SIGNAL.to_string(),
+                ),
                 completed: true,
                 kind: xai_grok_tools::computer::types::TaskKind::Bash,
                 block_waited: false,
@@ -1755,7 +1729,8 @@ impl MvpAgent {
                     gate,
                     subscription_tier,
                     feedback_trace_offer: self.feedback_trace_offer(),
-                    backend_billed: false,
+                    backend_billed: !xai_grok_login::backend::ActiveAuthBackend::default()
+                        .is_xai_authority(),
                 };
                 serde_json::to_value(auth_meta)
                     .ok()

@@ -155,6 +155,7 @@ mod links;
 mod media;
 mod modals;
 mod notices;
+pub(crate) use notices::ImagesDroppedBy;
 mod panes;
 mod paste;
 pub(crate) use kept_plan::KeptPlan;
@@ -266,7 +267,7 @@ pub struct PrivacyBannerState {
     pub(crate) active: bool,
     /// `[Opt in]` (opt in; ack only after ACP success).
     pub(crate) hit_opt_in: HitArea,
-    /// `[Opt out]` (ack now; record the decline).
+    /// `[Opt out]` (write the decline; ack only after ACP success).
     pub(crate) hit_opt_out: HitArea,
     /// "Terms" link (opens the terms of service).
     pub(crate) hit_terms: HitArea,
@@ -800,6 +801,14 @@ pub struct AgentView {
     pub(crate) failed_wake_marker_for: Option<String>,
     /// Wake prompts whose terminals landed; a late delta for one must not revive the stop affordance (see `note_streaming_wake_turn`). Cleared at replay-window entry; a queue broadcast naming one as running again removes that entry.
     pub(crate) finished_wake_prompts: std::collections::HashSet<String>,
+    /// Child prompt ids whose terminal marker was already applied.
+    pub(crate) ended_child_prompt_ids: std::collections::HashSet<String>,
+    /// Child prompt ids left for a newer turn. Not yet marked: the terminal still pushes a marker.
+    pub(crate) superseded_child_prompt_ids: std::collections::HashSet<String>,
+    /// `turnStartMs` of a child turn that ended with no prompt id. `None` if that turn had no start.
+    pub(crate) unidentified_child_turn_closed_ms: Option<i64>,
+    /// Prompt id that start belonged to. `None` when the closed turn had no id.
+    pub(crate) unidentified_child_turn_closed_prompt: Option<String>,
     /// The wake turn currently streaming, if any. See [`RunningWakeTurn`].
     pub(crate) running_wake_turn: Option<RunningWakeTurn>,
     pub active_pane: AgentPane,
@@ -932,6 +941,12 @@ pub struct AgentView {
     /// IDs of interjections this client sent and already rendered locally
     /// (optimistic echo). The shell broadcasts `x.ai/session/interjection` to every attached pane; when our own broadcast echoes back carrying an id in this set, `handle_interjection` drops it (we already showed it) and removes the id. Other panes (which lack the id) render it. This is the queue's optimistic-echo and reconcile-by-id pattern, applied so the originator gets instant feedback AND viewers stay in sync.
     pub self_interjection_ids: std::collections::HashSet<String>,
+    /// Optimistic interjection scrollback rows, keyed by `interjection_id`.
+    /// Failed sends remove these entries by id so retry cannot drop the wrong identical follow-up.
+    pub interjection_painted_blocks: std::collections::HashMap<String, crate::scrollback::EntryId>,
+    /// Original images for a painted interjection, restored if the send fails.
+    pub interjection_retry_images:
+        std::collections::HashMap<String, Vec<crate::prompt_images::PastedImage>>,
     /// Local wall-clock time when the most recent turn finished
     /// (success, failure, or cancellation). Used by the dashboard modal to display "Nm ago" idle markers. Initialised to the agent-creation time in [`AgentView::new`] so newly-created agents that have never run a turn still show a sensible relative time.
     pub last_active_at: Option<Instant>,
@@ -1298,6 +1313,10 @@ pub struct AgentView {
     /// Set when a session create or fork is dispatched. Cleared when the id binds or the create fails.
     /// Renders "Starting session…" in the turn-status row.
     pub(crate) session_starting_since: Option<Instant>,
+    /// Latest `session/new` setup step from `x.ai/session/setup`; names the stuck step on a timeout. Cleared on bind/fail.
+    pub(crate) session_new_phase: Option<xai_grok_shell::agent::SessionSetupPhase>,
+    /// The create's `_meta.sessionId`, held until `SessionCreated` binds it, so setup phases route here. Cleared on bind/fail.
+    pub(crate) pending_session_id: Option<agent_client_protocol::SessionId>,
     /// Last synced ACP command generation. When this differs from `session.available_commands_generation`, `sync_acp_commands()`
     /// is called on the prompt. Starts at 0 so bootstrap (generation 1)
     /// triggers an initial sync.

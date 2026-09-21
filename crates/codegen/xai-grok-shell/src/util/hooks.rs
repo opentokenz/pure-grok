@@ -125,6 +125,14 @@ pub(crate) fn discover_hook_source_paths(
     HookSourcePaths { global, project }
 }
 
+/// The disabled-hooks file plus the resolved `allow_managed_hooks_only` pin.
+pub(crate) fn disabled_hooks_snapshot() -> xai_grok_hooks::trust::DisabledHooks {
+    let managed_only = xai_grok_workspace::permission::resolution::managed_settings()
+        .non_managed_hooks
+        .is_disabled();
+    xai_grok_hooks::trust::DisabledHooks::load(managed_only)
+}
+
 /// Single load entry point: build compat-aware sources, gate project sources on trust, then load.
 /// Every session-startup and mid-session reload site routes through here so the source policy stays in one place.
 pub(crate) fn discover_hooks(

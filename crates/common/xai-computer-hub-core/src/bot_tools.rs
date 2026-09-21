@@ -17,6 +17,7 @@ pub const GROK_BOT_TOOL_IDS: &[&str] = &[
     "bot_transcript_offbox",
     "bot_await_turn",
     "bot_search_agents",
+    "bot_voice_call_plan",
 ];
 
 /// Whether `name` is a hub-synthesized Grok Bot harness tool.
@@ -54,12 +55,13 @@ pub const GROK_BOT_TOOL_DESCRIPTIONS: &[(&str, &str)] = &[
         "bot_create_agent",
         "Create a Grok Bot agent. It greets the user itself; send no first \
          prompt, never quote its id. Cannot be deleted; check bot_list_agents \
-         first.",
+         first. Only when the user asks for a new agent; to reach an existing \
+         one use bot_list_agents then bot_send_prompt. One agent per call.",
     ),
     (
         "bot_list_agents",
         "List all Grok Bot agents on the user's box with id, name, description, \
-         and status. Wakes the box.",
+         and status. Wakes the box. Its ids are the only valid agent_id values.",
     ),
     (
         "bot_send_prompt",
@@ -107,6 +109,12 @@ pub const GROK_BOT_TOOL_DESCRIPTIONS: &[(&str, &str)] = &[
          want. Returns the best matches only; bot_list_agents shows every bot. \
          Wakes the box.",
     ),
+    (
+        "bot_voice_call_plan",
+        "Plan a voice call with a Grok Bot agent: its spoken instructions, \
+         voice-side tools, greeting, and task receipt. For a voice backend at \
+         dial time; sends nothing to the agent.",
+    ),
 ];
 
 /// The model-facing description for a Grok Bot tool id, if known.
@@ -116,6 +124,13 @@ pub fn grok_bot_tool_description(name: &str) -> Option<&'static str> {
         .find(|(id, _)| *id == name)
         .map(|(_, desc)| *desc)
 }
+
+/// The model must paste a roster id, not invent a name or a shortened UUID;
+/// the full rule sits on bot_send_prompt, the reads carry the pointer.
+const AGENT_ID_PARAM_DESCRIPTION: &str = "Agent id pasted from bot_list_agents.";
+const SEND_AGENT_ID_DESCRIPTION: &str = "Opaque id copied exactly from \
+     bot_list_agents or bot_search_agents; never a name, never typed from \
+     memory or shortened.";
 
 /// Flattened JSON Schema for a Grok Bot tool's arguments.
 ///
@@ -151,7 +166,7 @@ pub fn grok_bot_tool_arguments_schema(name: &str) -> Option<serde_json::Value> {
             "properties": {
                 "agent_id": {
                     "type": "string",
-                    "description": "Agent id."
+                    "description": SEND_AGENT_ID_DESCRIPTION
                 },
                 "prompt": {
                     "type": "string",
@@ -185,7 +200,7 @@ pub fn grok_bot_tool_arguments_schema(name: &str) -> Option<serde_json::Value> {
             "properties": {
                 "agent_id": {
                     "type": "string",
-                    "description": "Agent id."
+                    "description": AGENT_ID_PARAM_DESCRIPTION
                 }
             }
         }),
@@ -196,7 +211,7 @@ pub fn grok_bot_tool_arguments_schema(name: &str) -> Option<serde_json::Value> {
             "properties": {
                 "agent_id": {
                     "type": "string",
-                    "description": "Agent id."
+                    "description": AGENT_ID_PARAM_DESCRIPTION
                 },
                 "limit": {
                     "type": "integer",
@@ -223,7 +238,7 @@ pub fn grok_bot_tool_arguments_schema(name: &str) -> Option<serde_json::Value> {
             "properties": {
                 "agent_id": {
                     "type": "string",
-                    "description": "Agent id."
+                    "description": AGENT_ID_PARAM_DESCRIPTION
                 },
                 "limit": {
                     "type": "integer",
@@ -242,7 +257,7 @@ pub fn grok_bot_tool_arguments_schema(name: &str) -> Option<serde_json::Value> {
             "properties": {
                 "agent_id": {
                     "type": "string",
-                    "description": "Agent id."
+                    "description": AGENT_ID_PARAM_DESCRIPTION
                 },
                 "limit": {
                     "type": "integer",
@@ -261,7 +276,7 @@ pub fn grok_bot_tool_arguments_schema(name: &str) -> Option<serde_json::Value> {
             "properties": {
                 "agent_id": {
                     "type": "string",
-                    "description": "Agent id."
+                    "description": AGENT_ID_PARAM_DESCRIPTION
                 },
                 "cursor": {
                     "type": "string",
@@ -276,7 +291,7 @@ pub fn grok_bot_tool_arguments_schema(name: &str) -> Option<serde_json::Value> {
             "properties": {
                 "agent_id": {
                     "type": "string",
-                    "description": "Agent id; must match the handle's agent."
+                    "description": "Agent id pasted from bot_list_agents; must match the handle's agent."
                 },
                 "handle": {
                     "type": "object",
@@ -309,6 +324,25 @@ pub fn grok_bot_tool_arguments_schema(name: &str) -> Option<serde_json::Value> {
                 }
             }
         }),
+        "bot_voice_call_plan" => serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["agent_id"],
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "Agent id."
+                },
+                "user_name": {
+                    "type": "string",
+                    "description": "What the bot should call the user."
+                },
+                "spoken_language": {
+                    "type": "string",
+                    "description": "Language the call is spoken in."
+                }
+            }
+        }),
         _ => return None,
     })
 }
@@ -329,6 +363,35 @@ mod tests {
                 .iter()
                 .all(|(_, desc)| !desc.trim().is_empty())
         );
+    }
+
+    #[test]
+    fn descriptions_steer_copied_agent_ids_and_create_sparingly() {
+        let create = grok_bot_tool_description("bot_create_agent").expect("bot_create_agent");
+        for needle in [
+            "Only when the user asks for a new agent",
+            "bot_list_agents then bot_send_prompt",
+            "One agent per call",
+        ] {
+            assert!(
+                create.contains(needle),
+                "bot_create_agent missing {needle:?}"
+            );
+        }
+        let send = grok_bot_tool_arguments_schema("bot_send_prompt").expect("bot_send_prompt");
+        let agent_id = send["properties"]["agent_id"]["description"]
+            .as_str()
+            .expect("agent_id description");
+        for needle in [
+            "copied exactly from bot_list_agents or bot_search_agents",
+            "opaque id",
+            "never typed from memory or shortened",
+        ] {
+            assert!(
+                agent_id.to_ascii_lowercase().contains(needle),
+                "bot_send_prompt.agent_id missing {needle:?}: {agent_id}"
+            );
+        }
     }
 
     #[test]
@@ -362,6 +425,14 @@ mod tests {
     fn search_agents_is_a_default_tool() {
         assert!(is_grok_bot_default_tool("bot_search_agents"));
         assert!(!is_grok_bot_default_tool("bot_future_tool"));
+    }
+
+    /// A voice backend opts in per toolbox; an ordinary agent must not see
+    /// the tool on an empty allowlist.
+    #[test]
+    fn voice_call_plan_is_declared_but_not_a_default_tool() {
+        assert!(is_grok_bot_tool("bot_voice_call_plan"));
+        assert!(!is_grok_bot_default_tool("bot_voice_call_plan"));
     }
 
     /// Clients advertise this schema from the shared table before the

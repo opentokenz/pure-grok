@@ -809,7 +809,7 @@ fn unwrap_invocation_checked(invocation: &ShellInvocation) -> CheckedInvocationP
     }
 }
 
-enum ArgText {
+pub(crate) enum ArgText {
     /// Literal path/word, no runtime expansion.
     Literal(String),
     /// Runtime expansion; unpinnable, so callers prompt.
@@ -892,7 +892,7 @@ fn decode_double_quoted_content(content: &str) -> Option<String> {
     Some(out)
 }
 
-fn shell_node_arg(node: Node<'_>, src: &str) -> Option<ArgText> {
+pub(crate) fn shell_node_arg(node: Node<'_>, src: &str) -> Option<ArgText> {
     let text = || node.utf8_text(src.as_bytes()).ok().map(str::to_owned);
     match node.kind() {
         "variable_assignment" => None,

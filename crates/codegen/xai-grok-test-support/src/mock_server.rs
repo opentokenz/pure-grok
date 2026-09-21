@@ -159,6 +159,37 @@ struct RouterState {
     startup_fetch_stall: Arc<std::sync::RwLock<StartupFetchStall>>,
     startup_stalls_served: Arc<AtomicU32>,
     user_tier: Arc<std::sync::RwLock<Option<String>>>,
+    user_team: Arc<std::sync::RwLock<Option<MockUserTeam>>>,
+    user_can_administer_team: Arc<std::sync::RwLock<MockCanAdministerTeam>>,
+}
+
+/// `teamId`, `teamName`, and `teamRole` on `GET /v1/user`.
+#[derive(Debug, Clone)]
+pub struct MockUserTeam {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+}
+
+/// `canAdministerTeam` on `GET /v1/user`. `Omitted` leaves the key out; `Unresolved` is `null`,
+/// the proxy's answer when it could not resolve the caller's team-administration capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockCanAdministerTeam {
+    Omitted,
+    Unresolved,
+    Allowed,
+    Denied,
+}
+
+impl MockCanAdministerTeam {
+    pub fn wire_value(self) -> Option<Value> {
+        match self {
+            Self::Omitted => None,
+            Self::Unresolved => Some(Value::Null),
+            Self::Allowed => Some(Value::Bool(true)),
+            Self::Denied => Some(Value::Bool(false)),
+        }
+    }
 }
 
 impl RouterState {
@@ -239,6 +270,10 @@ impl MockInferenceServer {
             startup_fetch_stall: Arc::new(std::sync::RwLock::new(StartupFetchStall::None)),
             startup_stalls_served: Arc::new(AtomicU32::new(0)),
             user_tier: Arc::new(std::sync::RwLock::new(None)),
+            user_team: Arc::new(std::sync::RwLock::new(None)),
+            user_can_administer_team: Arc::new(std::sync::RwLock::new(
+                MockCanAdministerTeam::Omitted,
+            )),
         };
         let app = Self::build_router(state.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -435,6 +470,14 @@ impl MockInferenceServer {
         *self.state.user_tier.write().unwrap() = tier.map(str::to_owned);
     }
 
+    pub fn set_user_team(&self, team: MockUserTeam) {
+        *self.state.user_team.write().unwrap() = Some(team);
+    }
+
+    pub fn set_user_can_administer_team(&self, can_administer: MockCanAdministerTeam) {
+        *self.state.user_can_administer_team.write().unwrap() = can_administer;
+    }
+
     /// Defaults to `"end_turn"`.
     pub fn set_messages_stop_reason(&self, stop_reason: impl Into<String>) {
         self.state
@@ -616,17 +659,22 @@ impl MockInferenceServer {
             .route(
                 "/v1/privacy/coding-data-retention",
                 put({
-                    let log = state.log.clone();
+                    let state = state.clone();
                     move |headers: HeaderMap, Json(body): Json<Value>| {
-                        let log = log.clone();
+                        let state = state.clone();
                         async move {
-                            log.record("PUT", "/v1/privacy/coding-data-retention", &body, &headers);
+                            let path = "/v1/privacy/coding-data-retention";
+                            state.log.record("PUT", path, &body, &headers);
+                            // Lets a test refuse the write
+                            if let Some(s) = state.overrides.pop_scripted(path) {
+                                return s.into_response_paced(None, None).await;
+                            }
                             // Echo the received flag back like the real cli-chat-proxy does on success
                             let opt_out = body
                                 .get("codingDataRetentionOptOut")
                                 .cloned()
                                 .unwrap_or(Value::Bool(false));
-                            Json(json!({ "codingDataRetentionOptOut": opt_out }))
+                            Json(json!({ "codingDataRetentionOptOut": opt_out })).into_response()
                         }
                     }
                 }),
@@ -645,14 +693,25 @@ impl MockInferenceServer {
                             };
                             state.log.record_get(&path);
                             let tier = state.user_tier.read().unwrap().clone();
+                            let team = state.user_team.read().unwrap().clone();
+                            let can_administer =
+                                state.user_can_administer_team.read().unwrap().wire_value();
                             let mut body = json!({
                                 "userId": "mock-user",
                                 "email": "mock-user@test.invalid",
                             });
-                            if let Some(t) = tier
-                                && let Some(obj) = body.as_object_mut()
-                            {
-                                obj.insert("subscriptionTier".into(), json!(t));
+                            if let Some(obj) = body.as_object_mut() {
+                                if let Some(t) = tier {
+                                    obj.insert("subscriptionTier".into(), json!(t));
+                                }
+                                if let Some(team) = team {
+                                    obj.insert("teamId".into(), json!(team.id));
+                                    obj.insert("teamName".into(), json!(team.name));
+                                    obj.insert("teamRole".into(), json!(team.role));
+                                }
+                                if let Some(can_administer) = can_administer {
+                                    obj.insert("canAdministerTeam".into(), can_administer);
+                                }
                             }
                             Json(body).into_response()
                         }

@@ -24,7 +24,11 @@
 //! 3. Re-runs the `hello` handshake.
 //! 4. The ToolServer replays `serve{session_id, tools}` per active
 //!    session via the on_reconnect callback. The server auto-registers
-//!    sessions from `serve` so no separate wire call is needed.
+//!    sessions from `serve` so no separate wire call is needed. A harness
+//!    replays `session_open` and then every `session_bind_server` it last
+//!    succeeded with, so the hub forwards a fresh `session.bind` — stamped
+//!    with its current policy — to each tool server the session was bound
+//!    to (a hub roll drops both sockets and re-stamps nothing by itself).
 //! 5. Drains any outbound frames that buffered during step 1-4.
 use crate::auth::{AuthCredential, AuthProvider, PrincipalKey};
 use crate::demux::Demux;
@@ -51,7 +55,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 use xai_tool_protocol::{
     ConnectionId, ConnectionKind, JsonRpcId, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion,
-    Method, PingFrame, PongFrame, ResponseOutcome, SessionId,
+    Method, PingFrame, PongFrame, ResponseOutcome, ServerId, SessionBindServerParams, SessionId,
 };
 /// Outbound mpsc bound. Picked to match the server's per-actor outbound
 /// buffer so a single-process roundtrip never dead-blocks on sender
@@ -653,6 +657,11 @@ struct HubConnectionInner {
     /// Refcounted bound-session set. Used by the reconnect path to
     /// re-issue `register_session` for every still-live session.
     bound_sessions: Arc<RefCountedSet<SessionId>>,
+    /// The last `session_bind_server` that succeeded per session and tool
+    /// server, replayed after `session_open` on reconnect. Kept here rather
+    /// than on the harness because the connection owns the replay and the
+    /// harness only learns of a reconnect after it.
+    last_binds: dashmap::DashMap<SessionId, Vec<SessionBindServerParams>>,
     /// Serialises a session's refcount edge with the lifecycle frame that
     /// edge emits. Without it a drop's "decrement to zero" and a concurrent
     /// build's "increment from zero" can interleave so `session_detach` is
@@ -756,27 +765,30 @@ impl HubConnection {
             };
             attempt += 1;
             let cred = config.credential.current();
-            let attempt_result = match tokio::time::timeout(attempt_budget, async {
-                let ws = hedged_open_socket(
-                    &config.url,
-                    &cred,
-                    config.kind,
-                    config.alpha_test_key.as_deref(),
-                    config.allow_insecure_ws,
-                    hedge_after.filter(|delay| *delay < attempt_budget),
-                )
-                .await?;
-                let (sink, stream) = ws.split();
-                run_handshake(
-                    sink,
-                    stream,
-                    config.kind,
-                    config.server_id.clone(),
-                    config.server_description.clone(),
-                    config.server_metadata.clone(),
-                )
-                .await
-            })
+            let attempt_result = match tokio::time::timeout(
+                attempt_budget,
+                Box::pin(async {
+                    let ws = hedged_open_socket(
+                        &config.url,
+                        &cred,
+                        config.kind,
+                        config.alpha_test_key.as_deref(),
+                        config.allow_insecure_ws,
+                        hedge_after.filter(|delay| *delay < attempt_budget),
+                    )
+                    .await?;
+                    let (sink, stream) = ws.split();
+                    run_handshake(
+                        sink,
+                        stream,
+                        config.kind,
+                        config.server_id.clone(),
+                        config.server_description.clone(),
+                        config.server_metadata.clone(),
+                    )
+                    .await
+                }),
+            )
             .await
             {
                 Ok(result) => result,
@@ -857,6 +869,7 @@ impl HubConnection {
             outbound_tx,
             demux: demux.clone(),
             bound_sessions: bound_sessions.clone(),
+            last_binds: dashmap::DashMap::new(),
             session_lifecycle: parking_lot::Mutex::new(()),
             connection_id,
             hello_capabilities: parking_lot::RwLock::new(ack.capabilities),
@@ -983,7 +996,37 @@ impl HubConnection {
     /// the last borrower drops. Returns the post-decrement count
     /// (`Some(0)` = last borrower; `None` = key was absent).
     pub fn untrack_session(&self, session_id: &SessionId) -> Option<u64> {
-        self.inner.bound_sessions.decrement(session_id)
+        let count = self.inner.bound_sessions.decrement(session_id);
+        if count == Some(0) {
+            self.inner.last_binds.remove(session_id);
+        }
+        count
+    }
+    /// Remember a `session_bind_server` that the hub accepted, so a reconnect
+    /// replays it (one entry per tool server; a rebind of the same server
+    /// replaces its entry).
+    pub(crate) fn record_session_bind(
+        &self,
+        session_id: &SessionId,
+        params: SessionBindServerParams,
+    ) {
+        let mut binds = self.inner.last_binds.entry(session_id.clone()).or_default();
+        binds.retain(|b| b.server_id != params.server_id);
+        binds.push(params);
+    }
+    /// Drop the replay entry for `server_id` after a `session_unbind_server`
+    /// the hub accepted; `None` drops every server of the session (close).
+    pub(crate) fn forget_session_bind(&self, session_id: &SessionId, server_id: Option<&ServerId>) {
+        let Some(server_id) = server_id else {
+            self.inner.last_binds.remove(session_id);
+            return;
+        };
+        if let Some(mut binds) = self.inner.last_binds.get_mut(session_id) {
+            binds.retain(|b| &b.server_id != server_id);
+        }
+        self.inner
+            .last_binds
+            .remove_if(session_id, |_, binds| binds.is_empty());
     }
     /// [`Self::untrack_session`] for a harness leaving a pooled connection
     /// that stays open for other borrowers: when this was the last borrower,
@@ -1001,6 +1044,7 @@ impl HubConnection {
         if self.inner.bound_sessions.decrement(session_id) != Some(0) {
             return false;
         }
+        self.inner.last_binds.remove(session_id);
         if self.supports(Method::SessionDetach.as_wire_str()) != Some(false) {
             try_send_request_on_drop(
                 self,
@@ -1324,7 +1368,7 @@ async fn open_socket(
     }
     let _ = alpha_test_key;
     xai_tracing::http_client::attach_trace_to_http_request(headers);
-    let (ws, _resp) = connect_async(request)
+    let (ws, _resp) = Box::pin(connect_async(request))
         .await
         .map_err(ClientError::from_handshake_error)?;
     Ok(ws)
@@ -2077,6 +2121,61 @@ where
         }
     }
 }
+/// Send one replay request on the fresh socket and wait for *its* reply
+/// (best-effort, bounded; the reconnect must not hang on the hub's reply).
+///
+/// The reader phase is not running yet, so every other frame that arrives
+/// first is handled here the way it would handle it: data frames go to the
+/// demux (a `tools_changed` the hub emits while serving a replayed bind
+/// must reach the session inbox), an app ping is answered on the sink, an
+/// app/WS pong counts as liveness. Discarding "the next frame" as the ack
+/// lost whichever of those the hub wrote first.
+async fn replay_request<P: serde::Serialize>(
+    inner: &HubConnectionInner,
+    sink: &mut SplitSink<WsStream, Message>,
+    stream: &mut SplitStream<WsStream>,
+    request: &xai_tool_protocol::JsonRpcRequest<P>,
+) {
+    let Ok(text) = serde_json::to_string(request) else {
+        return;
+    };
+    let Ok(request_id) = serde_json::to_value(&request.id) else {
+        return;
+    };
+    let _ = SinkExt::send(sink, Message::Text(text.into())).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let Ok(next) = tokio::time::timeout_at(deadline, StreamExt::next(stream)).await else {
+            return;
+        };
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                if is_reply_to(text.as_ref(), &request_id) {
+                    return;
+                }
+                match classify_inbound_text(inner, text.as_ref()) {
+                    InboundText::AppPing { pong: Some(pong) } => {
+                        let _ = SinkExt::send(sink, Message::Text(pong.into())).await;
+                    }
+                    InboundText::AppPong => inner.health.record_inbound(),
+                    InboundText::AppPing { pong: None }
+                    | InboundText::Data
+                    | InboundText::Unparseable => {}
+                }
+            }
+            Some(Ok(Message::Pong(_))) => inner.health.record_inbound(),
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+            Some(Ok(_)) => {}
+        }
+    }
+}
+/// Whether `text` is the JSON-RPC response to the request with `id`.
+fn is_reply_to(text: &str, id: &Value) -> bool {
+    serde_json::from_str::<Value>(text).is_ok_and(|frame| {
+        frame.get("id") == Some(id)
+            && (frame.get("result").is_some() || frame.get("error").is_some())
+    })
+}
 /// Reconnect once and replay every session binding + tool registration.
 async fn reconnect_and_replay(
     inner: &HubConnectionInner,
@@ -2105,9 +2204,10 @@ async fn reconnect_and_replay(
     )
     .await?;
     let sessions = inner.bound_sessions.snapshot_keys();
+    let mut binds_replayed = 0usize;
     if inner.kind == ConnectionKind::Harness {
         for sid in &sessions {
-            let req = xai_tool_protocol::JsonRpcRequest {
+            let open = xai_tool_protocol::JsonRpcRequest {
                 jsonrpc: xai_tool_protocol::JsonRpcVersion,
                 id: xai_tool_protocol::JsonRpcId::new_uuid_v7(),
                 session_id: Some(sid.clone()),
@@ -2117,10 +2217,22 @@ async fn reconnect_and_replay(
                     last_seq: None,
                 },
             };
-            if let Ok(text) = serde_json::to_string(&req) {
-                let _ = SinkExt::send(&mut sink, Message::Text(text.into())).await;
-                let _ = tokio::time::timeout(Duration::from_secs(5), StreamExt::next(&mut stream))
-                    .await;
+            replay_request(inner, &mut sink, &mut stream, &open).await;
+            let binds = inner
+                .last_binds
+                .get(sid)
+                .map(|binds| binds.clone())
+                .unwrap_or_default();
+            for params in binds {
+                let bind = xai_tool_protocol::JsonRpcRequest {
+                    jsonrpc: xai_tool_protocol::JsonRpcVersion,
+                    id: xai_tool_protocol::JsonRpcId::new_uuid_v7(),
+                    session_id: Some(sid.clone()),
+                    method: Method::SessionBindServer.as_wire_str().to_owned(),
+                    params,
+                };
+                replay_request(inner, &mut sink, &mut stream, &bind).await;
+                binds_replayed += 1;
             }
         }
     }
@@ -2129,6 +2241,7 @@ async fn reconnect_and_replay(
     info!(
         attempt,
         sessions_replayed,
+        binds_replayed,
         cause = outage.cause.label(),
         close_code = ?outage.cause.close_code(),
         error_detail = ?outage.cause.detail(),

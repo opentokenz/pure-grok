@@ -276,6 +276,10 @@ explore = "grok-4.6"                 # route explore to a specific model
 
 Per-type model overrides apply for any parent. Without an override, a subagent inherits the parent's model.
 
+### Model Selection by the Agent
+
+The `spawn_subagent` tool offers the agent a `model` argument, and its description lists the models you can pick, for when you explicitly ask for a subagent on a different model. With `[features] subagent_model_inheritance = true` (or `GROK_SUBAGENT_MODEL_INHERITANCE=1`), both are hidden whenever every model in your picker is an xAI model: subagents then always inherit the parent's model, and a spawn that still names one fails with a message asking the agent to retry without it. Catalogs with a third-party model, a model with no declared family, or a catalog still loading keep the argument. `[subagents.models]` pins, roles, and personas are unaffected. Read when a session starts; changing it requires a restart. Precedence: a `requirements.toml`/MDM pin, then the environment variable, then `config.toml`, then remote settings, then the default (off).
+
 ### Custom Roles and Personas
 
 Define custom roles with their own capability and model defaults:

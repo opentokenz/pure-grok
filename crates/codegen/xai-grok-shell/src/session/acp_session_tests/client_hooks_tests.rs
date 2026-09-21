@@ -1002,6 +1002,7 @@ async fn post_tool_use_dispatch_merges_file_then_client_contributions() {
                 tool_call_id: acp::ToolCallId::new("call_1"),
                 tool_name: "search__memory".to_string(),
                 raw_arguments: "{}".to_string(),
+                mcp_file: None,
                 parsed_args: serde_json::json!({}),
                 model_id: "test-model".to_string(),
                 concatenated_json_count: 0,

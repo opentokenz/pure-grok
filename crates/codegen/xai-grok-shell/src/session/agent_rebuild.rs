@@ -28,6 +28,10 @@
 //! The subagent channels are wrapped in a `ChannelBackend` behind `SubagentBackendResource`.
 //! On rebuild, we must reuse the **same** senders so the existing coordinator keeps receiving requests.
 //! A fresh channel would orphan the running coordinator.
+use crate::agent::remote_config::task_model_policy::{
+    LatchedTaskModelSelection, TaskModelPolicyInputs, latch_task_model_presentation,
+    presentation_applied_event, rejection_sink,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,6 +66,27 @@ pub(crate) struct ResolvedToolParamsJson {
     /// `[toolset.ask_user_question]` timeout policy for the ask tool.
     pub ask_user_question: Option<serde_json::Map<String, serde_json::Value>>,
 }
+/// The live memory-v2 file-access policy shared by spawn, the `/memory` toggle, and rebuilds.
+/// The lock never escapes: readers get a clone, writers replace the value.
+pub(crate) struct MemoryV2AccessSlot(
+    parking_lot::Mutex<Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>>,
+);
+impl MemoryV2AccessSlot {
+    pub(crate) fn new(
+        access: Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>,
+    ) -> Self {
+        Self(parking_lot::Mutex::new(access))
+    }
+    pub(crate) fn get(&self) -> Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource> {
+        self.0.lock().clone()
+    }
+    pub(crate) fn set(
+        &self,
+        access: Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>,
+    ) {
+        *self.0.lock() = access;
+    }
+}
 /// Cached recipe for building a session-scoped [`Agent`].
 /// See module docs for the invariant: this is the only construction site for `Agent` in the shell crate.
 /// Cloning is intentionally not derived; the spec lives behind an [`Arc`] and is shared by cloning that `Arc`.
@@ -73,13 +98,17 @@ pub(crate) struct AgentRebuildSpec {
     pub bridge_state_path: PathBuf,
     pub session_env: Arc<HashMap<String, String>>,
     pub models_manager: crate::agent::remote_config::ModelsManager,
+    pub task_model_policy: TaskModelPolicyInputs,
+    pub task_model_selection: LatchedTaskModelSelection,
     pub compaction_policy: CompactionPolicy,
     pub reminder_policy: ReminderPolicy,
     pub memory_enabled: bool,
     pub memory_global_path: Option<String>,
     pub memory_workspace_path: Option<String>,
     pub memory_backend: Option<Arc<dyn MemoryBackend>>,
-    pub memory_v2_access: Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>,
+    /// Live v2 file-access policy. `None` while v2 memory is off; the `/memory` toggle
+    /// replaces it so a later zero-turn rebuild renders the same prompt as a fresh spawn.
+    pub memory_v2_access: MemoryV2AccessSlot,
     pub memory_v2_exposed: bool,
     pub web_search_config: WebSearchConfig,
     /// `[toolset.web_search]` domain policy, resolved once at spawn.
@@ -184,6 +213,8 @@ impl AgentRebuildSpec {
             bridge_state_path,
             session_env,
             models_manager,
+            task_model_policy,
+            task_model_selection,
             compaction_policy,
             reminder_policy,
             memory_enabled,
@@ -268,6 +299,7 @@ impl AgentRebuildSpec {
             env.insert("GROK_SESSION_ID".to_string(), session_id_str.clone());
             Arc::new(env)
         };
+        let presentation = latch_task_model_presentation(models_manager, task_model_policy).await;
         let mut builder = AgentBuilder::new(
             working_directory.clone(),
             terminal_backend.clone(),
@@ -278,7 +310,7 @@ impl AgentRebuildSpec {
         .with_reminder_policy(reminder_policy.clone())
         .with_memory_enabled(*memory_enabled)
         .with_memory_paths(memory_global_path.clone(), memory_workspace_path.clone())
-        .with_memory_v2_access(memory_v2_access.clone(), *memory_v2_exposed)
+        .with_memory_v2_access(memory_v2_access.get(), *memory_v2_exposed)
         .with_is_non_interactive(*is_non_interactive)
         .with_system_prompt_label(system_prompt_label)
         .with_session_env(session_env.clone())
@@ -292,17 +324,13 @@ impl AgentRebuildSpec {
         .with_write_file_enabled(*write_file_enabled)
         .with_active_agent_messages_enabled(active_agent_messages_enabled)
         .with_fs(fs_backend.clone())
+        .with_mcp_file_input_preparation()
         .with_subagents_enabled(*subagents_enabled)
         .with_child_nested_subagents_allowed(1 < *subagents_max_depth)
         .with_subagent_toggle(subagent_toggle.clone())
         .with_background_workflows_enabled(*background_workflows_enabled)
-        .with_task_model_slugs(
-            models_manager
-                .available()
-                .keys()
-                .map(|model_id| model_id.0.to_string())
-                .collect::<Vec<_>>(),
-        )
+        .with_task_model_slugs(presentation.model_slugs.clone())
+        .with_task_model_selection(presentation.selection)
         .with_ask_user_question_enabled(*ask_user_question_enabled)
         .with_persona_summaries(persona_summaries.clone())
         .with_prompt_audience(*prompt_audience)
@@ -357,6 +385,12 @@ impl AgentRebuildSpec {
         let agent = builder.build().await?;
         crate::waterfall::mark(session_id_str, crate::waterfall::stage::SB_BUILDER_DONE);
         let agent_build_elapsed = build_phase_start.elapsed();
+        task_model_selection.set(presentation.selection);
+        xai_grok_telemetry::session_ctx::log_event(presentation_applied_event(
+            &presentation,
+            task_model_policy,
+            *prompt_audience,
+        ));
         let model_validator = models_manager.clone();
         agent
             .tool_bridge()
@@ -367,6 +401,7 @@ impl AgentRebuildSpec {
                             model_validator.task_model_error(requested)
                         }),
                     );
+                resources.insert(rejection_sink(session_id_str.clone()));
                 if let Some(event_tx) = subagent_event_tx.clone() {
                     use xai_grok_tools::implementations::grok_build::task::backend::{
                         ChannelBackend, SubagentBackendResource,
@@ -456,13 +491,22 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         bridge_state_path: std::env::temp_dir().join("test_tool_state.json"),
         session_env: Arc::new(HashMap::new()),
         models_manager: crate::agent::remote_config::ModelsManager::default(),
+        task_model_policy: TaskModelPolicyInputs {
+            inheritance: crate::agent::config::Resolved::new(
+                false,
+                crate::agent::config::ConfigSource::Default,
+            ),
+            remote_fetch_enabled: false,
+            forked_selection: None,
+        },
+        task_model_selection: LatchedTaskModelSelection::default(),
         compaction_policy: CompactionPolicy::default(),
         reminder_policy: ReminderPolicy::default(),
         memory_enabled: false,
         memory_global_path: None,
         memory_workspace_path: None,
         memory_backend: None,
-        memory_v2_access: None,
+        memory_v2_access: MemoryV2AccessSlot::new(None),
         memory_v2_exposed: false,
         web_search_config: WebSearchConfig::default(),
         web_search_domains: None,

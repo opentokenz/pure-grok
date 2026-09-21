@@ -2,7 +2,6 @@
 //! Covers the templated prefix, rules partitioning, and image payload preparation; large-prompt offload lives in `prompt_offload`.
 #![allow(clippy::items_after_test_module)]
 use super::*;
-use crate::session::repo_status_prefix::RepoStatusSnapshot;
 /// Replaces anything outside `[A-Za-z0-9._-]` with `_` so the result is a portable directory name on macOS/Linux.
 /// Whether `url` is an `http://` or `https://` URL, one the upstream API can fetch directly.
 /// `file://` and other local schemes are rejected by the API and must be inlined as a `data:` URL instead.
@@ -331,6 +330,92 @@ pub(super) fn install_system_prompt(
         }
     }
 }
+/// A resumed head keeps its enriched prompt, but its `<memory>` section must match this
+/// process's memory state: a `/memory` toggle persists the section into the head, while
+/// enablement is re-resolved from config on every spawn. On a mismatch the fresh prompt replaces
+/// the head; an injected manifest block is kept only while memory is on. Returns whether it changed.
+pub(super) fn reconcile_resumed_memory_section(
+    conversation: &mut [ConversationItem],
+    system_prompt: &str,
+) -> bool {
+    let Some(ConversationItem::System(sys)) = conversation.first_mut() else {
+        return false;
+    };
+    let manifest_start = sys.content.find(xai_chat_state::MEMORY_CONTEXT_OPEN_TAG);
+    let head_prompt = manifest_start
+        .and_then(|start| sys.content.get(..start))
+        .unwrap_or(&sys.content);
+    let fresh_has_memory = has_memory_section(system_prompt);
+    if has_memory_section(head_prompt) == fresh_has_memory {
+        return false;
+    }
+    let manifest_block = manifest_start
+        .filter(|_| fresh_has_memory)
+        .and_then(|start| sys.content.get(start..))
+        .map(str::to_owned);
+    sys.content = match manifest_block {
+        Some(block) => std::sync::Arc::<str>::from(format!(
+            "{}\n\n{block}",
+            system_prompt.trim_end_matches('\n')
+        )),
+        None => std::sync::Arc::<str>::from(system_prompt),
+    };
+    true
+}
+/// The `<memory>` block rendered by `templates/prompt.md` when `memory_v2_enabled` is set.
+fn has_memory_section(prompt: &str) -> bool {
+    prompt.contains("\n<memory>\n")
+}
+#[cfg(test)]
+mod reconcile_resumed_memory_section_tests {
+    use super::reconcile_resumed_memory_section;
+    use xai_chat_state::MEMORY_CONTEXT_OPEN_TAG;
+    use xai_grok_sampling_types::conversation::ConversationItem;
+    const WITH_MEMORY: &str = "rules\n\n<memory>\nuse memory\n</memory>\n\nmore";
+    const WITHOUT_MEMORY: &str = "rules\n\nmore";
+    fn head(conv: &[ConversationItem]) -> &str {
+        match conv.first() {
+            Some(ConversationItem::System(s)) => s.content.as_ref(),
+            _ => panic!("first item is not System"),
+        }
+    }
+    #[test]
+    fn matching_heads_are_left_alone() {
+        let mut conv = vec![ConversationItem::system(format!(
+            "{WITH_MEMORY} (enriched)"
+        ))];
+        assert!(!reconcile_resumed_memory_section(&mut conv, WITH_MEMORY));
+        assert_eq!(head(&conv), format!("{WITH_MEMORY} (enriched)"));
+        let mut conv = vec![ConversationItem::system(WITHOUT_MEMORY)];
+        assert!(!reconcile_resumed_memory_section(&mut conv, WITHOUT_MEMORY));
+    }
+    #[test]
+    fn memory_now_off_drops_section_and_manifest() {
+        let manifest = format!("{MEMORY_CONTEXT_OPEN_TAG}\nindex\n</memory-context>");
+        let mut conv = vec![ConversationItem::system(format!(
+            "{WITH_MEMORY}\n\n{manifest}"
+        ))];
+        assert!(reconcile_resumed_memory_section(&mut conv, WITHOUT_MEMORY));
+        assert_eq!(head(&conv), WITHOUT_MEMORY);
+    }
+    #[test]
+    fn memory_now_on_adds_section_and_keeps_manifest() {
+        let manifest = format!("{MEMORY_CONTEXT_OPEN_TAG}\nindex\n</memory-context>");
+        let mut conv = vec![ConversationItem::system(format!(
+            "{WITHOUT_MEMORY}\n\n{manifest}"
+        ))];
+        assert!(reconcile_resumed_memory_section(&mut conv, WITH_MEMORY));
+        assert_eq!(head(&conv), format!("{WITH_MEMORY}\n\n{manifest}"));
+    }
+    #[test]
+    fn memory_word_inside_manifest_does_not_count_as_a_section() {
+        let manifest = format!("{MEMORY_CONTEXT_OPEN_TAG}\nnote says\n<memory>\n</memory-context>");
+        let mut conv = vec![ConversationItem::system(format!(
+            "{WITHOUT_MEMORY}\n\n{manifest}"
+        ))];
+        assert!(!reconcile_resumed_memory_section(&mut conv, WITHOUT_MEMORY));
+    }
+}
 #[cfg(test)]
 mod install_system_prompt_tests {
     use super::install_system_prompt;
@@ -453,11 +538,10 @@ impl SessionActor {
                 def.include_browser_verification(),
             )
         };
-        let repo_status = self.resolve_repo_status_prefix().await;
         let mut prefix_carries_fallback_date = false;
         let mut out = if !matches!(template, UserMessageTemplate::Default) {
             if let Some(rendered) = self
-                .build_templated_user_message(cwd, template.clone(), repo_status.as_ref())
+                .build_templated_user_message(cwd, template.clone())
                 .await
             {
                 rendered
@@ -466,10 +550,10 @@ impl SessionActor {
                     "templated user message render failed; falling back to legacy prefix"
                 );
                 prefix_carries_fallback_date = !template.surfaces_local_date();
-                self.construct_legacy_prefix(cwd, repo_status.as_ref())
+                self.construct_legacy_prefix(cwd)
             }
         } else {
-            self.construct_legacy_prefix(cwd, repo_status.as_ref())
+            self.construct_legacy_prefix(cwd)
         };
         if matches!(template, UserMessageTemplate::Default) && include_verification {
             let (workspace_rules, mut user_rules) = self.gather_partitioned_rules();
@@ -528,21 +612,17 @@ impl SessionActor {
         partition_rules_by_scope(files, &grok_home, &vendor_homes, &workspace_roots)
     }
     /// Build the custom-templated first user message.
-    /// Gathers session-scoped inputs: today's date, VCS status, AGENTS.md rules, skill registry, and MCP servers.
+    /// Gathers session-scoped inputs: today's date, VCS root, AGENTS.md rules, skill registry, and MCP servers.
     /// Dispatches through `UserMessageContext::render`.
     async fn build_templated_user_message(
         &self,
         cwd: &std::path::Path,
         template: xai_grok_agent::prompt::user_message::UserMessageTemplate,
-        repo_status: Option<&RepoStatusSnapshot>,
     ) -> Option<String> {
         use xai_grok_agent::prompt::user_message::UserMessageContext;
         self.wait_for_mcp_startup_grace().await;
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let (vcs_root, vcs_status) = match repo_status {
-            Some(snapshot) => (snapshot.root.clone(), snapshot.templated_status()),
-            None => (None, None),
-        };
+        let vcs_root = self.vcs_root.clone();
         let (workspace_rules, user_rules) = self.gather_partitioned_rules();
         let mut user_rules = user_rules;
         let skills = self.slash_skills_for_resolve().await;
@@ -571,7 +651,6 @@ impl SessionActor {
             os_family: crate::util::uname::os_kernel_and_release(),
             shell,
             vcs_root,
-            vcs_status,
             today_local: Some(today_local),
             terminals_folder,
             workspace_rules,
@@ -590,55 +669,8 @@ impl SessionActor {
         };
         ctx.render(&bridge).await
     }
-    fn construct_legacy_prefix(
-        &self,
-        cwd: &std::path::Path,
-        repo_status: Option<&RepoStatusSnapshot>,
-    ) -> String {
-        let mut prefix = construct_user_message_minimal(cwd, None);
-        if let Some(status) = repo_status.and_then(|s| s.legacy_status()) {
-            prefix.push_str(&crate::session::user_message::format_vcs_status_block(
-                &status,
-                self.vcs_kind,
-            ));
-        }
-        prefix
-    }
-    async fn resolve_repo_status_prefix(&self) -> Option<RepoStatusSnapshot> {
-        use crate::session::repo_status_prefix::{
-            REPO_STATUS_WAIT_BUDGET, RepoStatusPlan, gather_repo_status,
-        };
-        match self.repo_status_prefetch.plan() {
-            RepoStatusPlan::NoRepo => None,
-            RepoStatusPlan::RootOnly { root, vcs_kind } => {
-                Some(RepoStatusSnapshot::root_only(root.clone(), *vcs_kind))
-            }
-            RepoStatusPlan::Gather { inputs, .. } => {
-                use tracing::Instrument;
-                let wait_start = std::time::Instant::now();
-                let snapshot = match self.repo_status_prefetch.take_prefetch() {
-                    Some(mut prefetch) => {
-                        prefetch
-                            .snapshot_within(REPO_STATUS_WAIT_BUDGET)
-                            .instrument(tracing::info_span!("prompt.repo_status_wait"))
-                            .await
-                    }
-                    None => gather_repo_status(inputs).await,
-                };
-                self.log_repo_status_wait(wait_start.elapsed());
-                Some(snapshot.unwrap_or_else(|| inputs.missed_snapshot()))
-            }
-        }
-    }
-    fn log_repo_status_wait(&self, waited: std::time::Duration) {
-        let wait_ms = self.repo_status_prefetch.record_wait(waited);
-        if wait_ms > 0 {
-            tracing::info!(
-                session_id = %self.session_info.id.0,
-                repo_status_wait_ms = wait_ms,
-                "user prefix waited on the repo status prefetch"
-            );
-        }
+    fn construct_legacy_prefix(&self, cwd: &std::path::Path) -> String {
+        construct_user_message_minimal(cwd, None)
     }
     /// `None` twin: descriptor materialization is unavailable in this build.
     fn workspace_mcps_root(_cwd: &std::path::Path) -> Option<std::path::PathBuf> {

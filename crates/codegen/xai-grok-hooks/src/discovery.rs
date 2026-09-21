@@ -23,17 +23,13 @@ impl HookRegistry {
         self.hooks.get(&event).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
-    /// True when any hook for `event` (or its alias spelling) passes the disable rule against `disabled`.
+    /// True when any hook for `event` (or its alias spelling) passes the skip rule against `disabled`.
     pub fn has_enabled_hooks_for_canonical(
         &self,
         event: HookEventName,
         disabled: &crate::trust::DisabledHooks,
     ) -> bool {
-        let enabled = |specs: &[HookSpec]| {
-            specs
-                .iter()
-                .any(|s| !crate::dispatcher::is_disabled(s, disabled))
-        };
+        let enabled = |specs: &[HookSpec]| specs.iter().any(|s| !disabled.blocks(s));
         let canonical = event.canonical();
         enabled(self.hooks_for(canonical))
             || (canonical == HookEventName::SubagentStop
@@ -828,6 +824,42 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"))
                 .is_managed_policy()
         );
+
+        // The signed cloud cache outranks the user-writable `$GROK_HOME` tiers it shares a directory with, and yields to root-owned policy
+        let registry = registry_from_specs_deduped(vec![
+            spec("managed:pre[0]", HookProvenance::Managed, 1),
+            spec(
+                "requirements/signed:pre[0]",
+                HookProvenance::SignedRequirements,
+                5000,
+            ),
+            spec(
+                "requirements/system:pre[0]",
+                HookProvenance::Requirements,
+                7,
+            ),
+        ]);
+        let hooks = registry.hooks_for(HookEventName::PreToolUse);
+        assert_eq!(hooks.len(), 1);
+        let kept = hooks
+            .first()
+            .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"));
+        assert_eq!(kept.layer, HookProvenance::Requirements);
+        assert_eq!(kept.timeout_ms, 7);
+        let registry = registry_from_specs_deduped(vec![
+            spec("managed:pre[0]", HookProvenance::Managed, 1),
+            spec(
+                "requirements/signed:pre[0]",
+                HookProvenance::SignedRequirements,
+                5000,
+            ),
+        ]);
+        let hooks = registry.hooks_for(HookEventName::PreToolUse);
+        let kept = hooks
+            .first()
+            .unwrap_or_else(|| panic!("expected hooks item 0: {hooks:?}"));
+        assert_eq!(kept.layer, HookProvenance::SignedRequirements);
+        assert!(kept.is_managed_policy());
     }
 
     /// Managed-policy hooks count as enabled for the stop-gate hot-path guard even when their name is in the disabled-hooks state.
@@ -852,18 +884,26 @@ mod tests {
         };
         let mut registry = HookRegistry::default();
         registry.append_specs(vec![spec.clone()]);
-        let disabled = crate::trust::DisabledHooks::from_names([spec.name.clone()]);
+        let disabled = crate::trust::DisabledHooks::new([spec.name.clone()], false);
         assert!(
             registry.has_enabled_hooks_for_canonical(HookEventName::Stop, &disabled),
             "managed-policy hook must count as enabled"
         );
 
         spec.layer = crate::config::HookProvenance::File;
+        spec.enabled = true;
         let mut registry = HookRegistry::default();
         registry.append_specs(vec![spec]);
         assert!(
             !registry.has_enabled_hooks_for_canonical(HookEventName::Stop, &disabled),
             "a disabled file hook must not count"
+        );
+        assert!(
+            !registry.has_enabled_hooks_for_canonical(
+                HookEventName::Stop,
+                &crate::trust::DisabledHooks::new([], true)
+            ),
+            "under allow_managed_hooks_only an enabled file hook must not count either"
         );
     }
 

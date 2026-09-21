@@ -587,6 +587,9 @@ pub struct FeedbackContext {
     pub context_tokens_used: u64,
     pub context_window_tokens: u64,
     pub session_cwd: String,
+    pub reasoning_effort: Option<crate::sampling::ReasoningEffort>,
+    pub model_id: Option<String>,
+    pub model_fingerprint: Option<String>,
 }
 
 // ── Startup hints ───────────────────────────────────────────────────────
@@ -598,8 +601,6 @@ pub struct FeedbackContext {
 pub struct StartupHints {
     #[serde(default)]
     pub non_interactive: bool,
-    #[serde(default)]
-    pub skip_git_status: bool,
     /// Leading conversation items to preserve verbatim across compaction (the immutable head).
     /// A fresh subagent's head is its spawn-injected items; a `resume_from` subagent's is just the System head so the resumed body stays compactable.
     #[serde(default)]

@@ -463,6 +463,7 @@ pub fn current_value_for(
         "compact_mode" => Some(SettingValue::Bool(ui.compact_mode)),
         "show_timestamps" => Some(SettingValue::Bool(ui.show_timestamps.unwrap_or(true))),
         "show_timeline" => Some(SettingValue::Bool(ui.show_timeline_enabled())),
+        "dashboard_preview" => Some(SettingValue::Bool(ui.dashboard_preview_enabled())),
         // The cache is the send-path source of truth (same pattern as group_tool_verbs)
         "page_flip_on_send" => Some(SettingValue::Bool(
             crate::appearance::cache::load_page_flip_on_send(),
@@ -672,7 +673,7 @@ pub fn current_value_for(
     }
 }
 
-/// Consent chooser: no docs tip, and no `d` reset (hint or key).
+/// Consent chooser: no docs tip, and no `d` reset inside the chooser (hint or key).
 pub fn is_consent_chooser(key: &str) -> bool {
     key == "coding_data_sharing"
 }
@@ -787,6 +788,9 @@ mod tests {
                         ui.show_timeline_enabled(),
                         "show_timeline default drifts from UiConfig::default()"
                     );
+                }
+                ("dashboard_preview", SettingKind::Bool { default }) => {
+                    assert_eq!(ui.dashboard_preview_enabled(), *default);
                 }
                 ("page_flip_on_send", SettingKind::Bool { default }) => {
                     assert_eq!(

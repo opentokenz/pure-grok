@@ -5,12 +5,12 @@ use super::ctx::{NO_SESSION_NOTICE, active_agent_session_id, with_active_agent};
 use crate::acp::meta::user_prompt_meta;
 use crate::app::actions::Effect;
 use crate::app::agent::{AgentCommand, AgentId};
-use crate::app::agent_view::{AgentView, PromptMode};
+use crate::app::agent_view::{AgentView, ImagesDroppedBy, PromptMode};
 use crate::app::app_view::{ActiveView, AppView};
 use crate::app::command_catalog::CommandCatalogSource;
 use crate::scrollback::EntryId;
 use crate::scrollback::block::RenderBlock;
-use crate::scrollback::blocks::SessionEvent;
+use crate::scrollback::blocks::{MemoryCommandKind, SessionEvent};
 use crate::scrollback::state::ScrollbackState;
 use agent_client_protocol as acp;
 use std::time::Instant;
@@ -98,15 +98,17 @@ pub(super) fn retire_optimistic_echo(
     }
 }
 
-/// Drain prompt-side images and snapshot all chip elements (paste blocks, @-file refs, image chips) into the most recently enqueued `QueuedPrompt`.
-/// Must be called after `enqueue_prompt` / `push_back` and before `prompt.set_text("")` (which clears element and image state).
-/// If the last queued entry already has `wire_blocks` (skill injection), images are dropped with a toast instead of merged.
-pub(super) fn drain_prompt_state_to_last_queued(agent: &mut AgentView) {
-    let prompt_state = agent.prompt.stash();
-    let (_, images, chip_elements) = prompt_state.into_submission();
-
+/// Hand a submission's chip snapshot and images to the most recently enqueued `QueuedPrompt`. The
+/// snapshot is taken once, by the caller, when the composer is consumed; nothing here touches the composer.
+/// Returns what the entry did not take; see [`attach_images_to_last_queued`].
+pub(super) fn attach_prompt_state_to_last_queued(
+    agent: &mut AgentView,
+    images: Vec<crate::prompt_images::PastedImage>,
+    chip_elements: Vec<crate::app::agent::ChipElement>,
+    notices: &mut Vec<String>,
+) -> Vec<crate::prompt_images::PastedImage> {
     let Some(entry) = agent.session.pending_prompts.back_mut() else {
-        return;
+        return images;
     };
 
     // Injected skill text can be shorter than the composer that supplied the chips.
@@ -116,17 +118,38 @@ pub(super) fn drain_prompt_state_to_last_queued(agent: &mut AgentView) {
         .filter(|chip| text.get(chip.range.clone()).is_some())
         .collect();
 
+    attach_images_to_last_queued(agent, images, notices)
+}
+
+/// Hand `images` to the most recently enqueued `QueuedPrompt`. A skill row (`wire_blocks`) and a command
+/// row (`/compact`) cannot carry them: the user is told (a notice queued on `notices`) and they come
+/// back, as they all do when no row exists. The caller releases what comes back.
+fn attach_images_to_last_queued(
+    agent: &mut AgentView,
+    images: Vec<crate::prompt_images::PastedImage>,
+    notices: &mut Vec<String>,
+) -> Vec<crate::prompt_images::PastedImage> {
     if images.is_empty() {
-        return;
+        return images;
     }
-
-    // wire_blocks policy: skill-injected prompts do not carry prompt images.
-    if entry.wire_blocks.is_some() {
-        agent.show_toast("Images removed (skill prompt)");
-        return;
-    }
-
-    entry.images = images;
+    let Some(entry) = agent.session.pending_prompts.back_mut() else {
+        return images;
+    };
+    let dropped_by = if entry.wire_blocks.is_some() {
+        ImagesDroppedBy::SkillPrompt
+    } else if entry.kind == crate::app::agent::QueueEntryKind::Command {
+        let token = crate::slash::parse_invocation(&entry.text).map_or("", |inv| inv.token);
+        if token == "compact" {
+            ImagesDroppedBy::CompactCommand
+        } else {
+            ImagesDroppedBy::SlashAction(token.to_owned())
+        }
+    } else {
+        entry.images = images;
+        return Vec::new();
+    };
+    notices.push(agent.images_dropped_by_command_notice(images.len(), dropped_by));
+    images
 }
 
 /// Try to send the next queued entry (prompt, command, or bash) if the agent is idle.
@@ -146,13 +169,78 @@ impl QueueDrain {
     }
 }
 
-/// The local drip-feed queue otherwise holds every queued prompt until the turn ends, so a message sent while waiting never reaches the shell.
-/// This therefore has to run on the send path itself (and when the /btw answer lands), not only after the next session update.
-/// Only a parked wait counts.
+/// Same as [`flush_held_local_queue_into_wait`].
 pub(crate) fn maybe_release_queued_prompt_into_turn(
     app: &mut AppView,
     agent_id: Option<AgentId>,
 ) -> Vec<Effect> {
+    flush_held_local_queue_into_wait(app, agent_id)
+}
+
+fn flush_target_id(app: &AppView, agent_id: Option<AgentId>) -> Option<AgentId> {
+    agent_id.or(match app.active_view {
+        ActiveView::Agent(id) => Some(id),
+        _ => None,
+    })
+}
+
+/// Inject held local follow-ups into a parked wait, oldest first.
+/// A leftover earlier row would otherwise resend after the wait.
+pub(crate) fn flush_held_local_queue_into_wait(
+    app: &mut AppView,
+    agent_id: Option<AgentId>,
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let mut skipped = Vec::new();
+    loop {
+        let released = release_queued_prompt_from(app, agent_id);
+        if !released.is_empty() {
+            effects.extend(released);
+            continue;
+        }
+        let Some(id) = flush_target_id(app, agent_id) else {
+            break;
+        };
+        let Some(agent) = app.agents.get_mut(&id) else {
+            break;
+        };
+        if matches!(agent.prompt_mode, PromptMode::EditingQueued { .. })
+            || agent.session.pending_prompts.is_empty()
+        {
+            break;
+        }
+        let front_unflushable = agent.session.pending_prompts.front().is_some_and(|p| {
+            !matches!(p.kind, crate::app::agent::QueueEntryKind::Prompt)
+                || !p.wire_matches_display()
+        });
+        if !front_unflushable {
+            break;
+        }
+        if let Some(row) = agent.session.pending_prompts.pop_front() {
+            skipped.push(row);
+        }
+    }
+    if let Some(id) = flush_target_id(app, agent_id)
+        && let Some(agent) = app.agents.get_mut(&id)
+    {
+        for row in skipped.into_iter().rev() {
+            agent.session.pending_prompts.push_front(row);
+        }
+    }
+    effects
+}
+
+/// Flush held follow-ups, then run `then`.
+pub(super) fn with_held_queue_flush(
+    app: &mut AppView,
+    then: impl FnOnce(&mut AppView) -> Vec<Effect>,
+) -> Vec<Effect> {
+    let mut effects = flush_held_local_queue_into_wait(app, None);
+    effects.extend(then(app));
+    effects
+}
+
+fn release_queued_prompt_from(app: &mut AppView, agent_id: Option<AgentId>) -> Vec<Effect> {
     use crate::app::agent::QueueEntryKind;
 
     if !crate::appearance::cache::load_follow_up_steer() {
@@ -177,14 +265,30 @@ pub(crate) fn maybe_release_queued_prompt_into_turn(
     if app.reconnect_pending {
         return Vec::new();
     }
-    if !agent.is_parked_on_sendable_wait() {
+    if !agent.is_parked_on_sendable_wait()
+        || agent.session.loading_replay
+        || agent.expect_send_now_cancel.is_some()
+    {
+        return Vec::new();
+    }
+    // Merged steer order is server-first; do not interject a local row ahead of a held server row.
+    let running = agent.session.current_prompt_id.as_deref();
+    let send_now = agent.expect_send_now_cancel.as_deref();
+    if agent.shared_queue.iter().any(|entry| {
+        crate::views::queue_pane::visible_held_server_row(
+            &entry.id,
+            running,
+            send_now,
+            &agent.send_now_painted_blocks,
+        )
+    }) {
         return Vec::new();
     }
     if matches!(agent.prompt_mode, PromptMode::EditingQueued { .. })
         || !agent
             .session
             .pending_prompts
-            .back()
+            .front()
             .is_some_and(|p| matches!(p.kind, QueueEntryKind::Prompt) && p.wire_matches_display())
     {
         return Vec::new();
@@ -193,7 +297,7 @@ pub(crate) fn maybe_release_queued_prompt_into_turn(
     let Some(agent) = app.agents.get_mut(&id) else {
         return Vec::new();
     };
-    let Some(queued) = agent.session.pending_prompts.pop_back() else {
+    let Some(queued) = agent.session.pending_prompts.pop_front() else {
         return Vec::new();
     };
     crate::unified_log::info(
@@ -204,10 +308,11 @@ pub(crate) fn maybe_release_queued_prompt_into_turn(
             "prompt_len": queued.text.len(),
         })),
     );
-    super::interject::dispatch_interject_on(app, id, queued.text, queued.images)
+    super::interject::dispatch_interject_from_held_queue(app, id, queued.text, queued.images)
 }
 
-pub(super) fn maybe_drain_queue(agent: &mut AgentView) -> QueueDrain {
+/// `notices` is `AppView::pending_image_notices`: a queued image that cannot be read is reported there.
+pub(super) fn maybe_drain_queue(agent: &mut AgentView, notices: &mut Vec<String>) -> QueueDrain {
     use crate::app::agent::QueueEntryKind;
     use crate::unified_log as ulog;
 
@@ -426,11 +531,13 @@ pub(super) fn maybe_drain_queue(agent: &mut AgentView) -> QueueDrain {
                 // Image-bearing prompt: build text and image content blocks
                 // Pass the session cwd so orphan `[Image #N: <path>]` placeholders can be recovered from disk via the shared helper
                 // Token ranges are not stamped here: the builder rewrites the text (placeholder stripping), which would shift byte offsets
-                let mut blocks = crate::prompt_images::build_content_blocks_with_workspace(
+                let build = crate::prompt_images::build_content_blocks_with_workspace_report(
                     queued.text,
                     queued.images,
                     Some(std::path::Path::new(&agent.session.cwd)),
                 );
+                notices.extend(agent.skipped_image_send_notice(&build.skipped_display_numbers));
+                let mut blocks = build.blocks;
                 if let Some(acp::ContentBlock::Text(tb)) = blocks.first_mut() {
                     let map = tb.meta.get_or_insert_with(acp::Meta::new);
                     xai_prompt_queue::stamp_combined_display_texts(map, &combined_segs);
@@ -469,33 +576,58 @@ pub(super) fn maybe_drain_queue(agent: &mut AgentView) -> QueueDrain {
             }
         }
         QueueEntryKind::Command => {
-            // Currently only `/compact`; future slash commands will branch here
-            agent.session.start_command(AgentCommand::Compact);
-            // Compact owns the pane; a leftover wake marker must not shadow stop.
+            let invocation = crate::slash::parse_invocation(&queued.text);
+            let token = invocation.as_ref().map_or("", |inv| inv.token);
+            let (command, started, effect) = match token {
+                "flush" => (
+                    AgentCommand::MemoryFlush,
+                    SessionEvent::MemoryCommandStarted {
+                        command: MemoryCommandKind::Flush,
+                    },
+                    Effect::MemoryFlush {
+                        agent_id,
+                        session_id,
+                    },
+                ),
+                "dream" => (
+                    AgentCommand::MemoryDream,
+                    SessionEvent::MemoryCommandStarted {
+                        command: MemoryCommandKind::Dream,
+                    },
+                    Effect::MemoryDream {
+                        agent_id,
+                        session_id,
+                    },
+                ),
+                _ => {
+                    let user_context = invocation
+                        .map(|inv| inv.args.trim())
+                        .filter(|args| !args.is_empty())
+                        .map(str::to_string);
+                    (
+                        AgentCommand::Compact,
+                        SessionEvent::CompactStarted,
+                        Effect::Compact {
+                            agent_id,
+                            session_id,
+                            user_context,
+                        },
+                    )
+                }
+            };
+            agent.session.start_command(command);
+            // The command owns the pane; a leftover wake marker must not shadow stop.
             agent.running_wake_turn = None;
             agent.turn_started_at = Some(Instant::now());
-            // Invocation marker: each `/compact` visibly owns its outcome line (completed/cancelled/failed)
-            // This matches the auto path's "Context N% full. Compacting…".
-            // Local block only: like the manual outcome lines it is not persisted, so resume replays neither
+            // Invocation marker: each run visibly owns its outcome line (completed/cancelled/failed)
+            // For `/compact` this matches the auto path's "Context N% full. Compacting…".
+            // Local block only: like the outcome lines it is not persisted, so resume replays neither
             agent
                 .scrollback
-                .push_block(RenderBlock::session_event(SessionEvent::CompactStarted));
-
-            let user_context = crate::slash::parse_invocation(&queued.text).and_then(|inv| {
-                let args = inv.args.trim();
-                if inv.token == "compact" && !args.is_empty() {
-                    Some(args.to_string())
-                } else {
-                    None
-                }
-            });
+                .push_block(RenderBlock::session_event(started));
 
             QueueDrain {
-                effects: vec![Effect::Compact {
-                    agent_id,
-                    session_id,
-                    user_context,
-                }],
+                effects: vec![effect],
                 page_flip_entry: None,
             }
         }
@@ -977,7 +1109,7 @@ pub(crate) fn maybe_drain_queue_and_note_peek(app: &mut AppView, agent_id: Agent
         let Some(agent) = app.agents.get_mut(&agent_id) else {
             return vec![];
         };
-        maybe_drain_queue(agent)
+        maybe_drain_queue(agent, &mut app.pending_image_notices)
     };
     note_peek_page_flip(app, agent_id, drain.page_flip_entry);
     drain.effects
@@ -1212,6 +1344,60 @@ mod tests {
     }
 
     #[test]
+    fn dream_drain_runs_as_a_tracked_command_with_an_outcome_line() {
+        use crate::app::actions::TaskResult;
+        use crate::app::dispatch::task_result::dispatch_task_result;
+        use crate::scrollback::blocks::SessionEvent;
+        use xai_grok_shell::extensions::memory::{MemoryDreamDisposition, MemoryDreamResponse};
+
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.enqueue_command("/dream".into());
+        let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
+        assert!(matches!(
+            drain.effects.as_slice(),
+            [Effect::MemoryDream { .. }]
+        ));
+        assert_eq!(
+            agent.session.state.command_in_flight(),
+            Some(&AgentCommand::MemoryDream)
+        );
+
+        dispatch_task_result(
+            TaskResult::MemoryDreamComplete {
+                agent_id: id,
+                result: Ok(MemoryDreamResponse {
+                    disposition: MemoryDreamDisposition::Completed,
+                    observation_count: 7,
+                    topics_affected: 3,
+                }),
+            },
+            &mut app,
+        );
+
+        let agent = test_agent(&app, id);
+        assert!(agent.session.state.is_idle());
+        let events: Vec<SessionEvent> = (0..agent.scrollback.len())
+            .filter_map(|i| match agent.scrollback.entry(i).map(|e| &e.block) {
+                Some(RenderBlock::SessionEvent(ev)) => Some(ev.event.clone()),
+                _ => None,
+            })
+            .collect();
+        match events.as_slice() {
+            [
+                SessionEvent::MemoryCommandStarted { .. },
+                SessionEvent::MemoryCommandCompleted {
+                    summary,
+                    succeeded: true,
+                    ..
+                },
+            ] => assert_eq!(summary, "Dream merged 7 observations into 3 topics."),
+            other => panic!("expected marker → outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn compact_drain_pushes_one_marker_paired_with_its_outcome() {
         use crate::app::actions::TaskResult;
         use crate::app::dispatch::task_result::dispatch_task_result;
@@ -1231,7 +1417,7 @@ mod tests {
         for _ in 0..2 {
             let agent = app.agents.get_mut(&id).unwrap();
             agent.session.enqueue_command("/compact".into());
-            let drain = maybe_drain_queue(agent);
+            let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
             assert!(
                 matches!(drain.effects.as_slice(), [Effect::Compact { .. }]),
                 "command drain must start one compact, got {:?}",
@@ -2251,7 +2437,7 @@ mod tests {
         let mut app = test_app_with_agent();
         let agent = app.agents.get_mut(&AgentId(0)).unwrap();
         agent.session.enqueue_prompt("first".into());
-        let started = maybe_drain_queue(agent);
+        let started = maybe_drain_queue(agent, &mut app.pending_image_notices);
         let entry_id = started.page_flip_entry.expect("prompt starts a page flip");
         assert_eq!(
             agent.scrollback.index_of_id(entry_id),
@@ -2259,7 +2445,7 @@ mod tests {
         );
 
         agent.session.enqueue_prompt("queued".into());
-        let blocked = maybe_drain_queue(agent);
+        let blocked = maybe_drain_queue(agent, &mut app.pending_image_notices);
         assert!(blocked.effects.is_empty());
         assert!(blocked.page_flip_entry.is_none());
     }
@@ -2271,7 +2457,7 @@ mod tests {
         agent.session.enqueue_prompt("queued follow-up".into());
         agent.session.hook_block_hold = true;
 
-        let held = maybe_drain_queue(agent);
+        let held = maybe_drain_queue(agent, &mut app.pending_image_notices);
         assert!(held.effects.is_empty(), "a held queue must not drain");
         assert_eq!(
             agent.session.pending_prompts.len(),
@@ -2280,7 +2466,7 @@ mod tests {
         );
 
         agent.release_hook_block_hold();
-        let drained = maybe_drain_queue(agent);
+        let drained = maybe_drain_queue(agent, &mut app.pending_image_notices);
         assert!(
             !drained.effects.is_empty(),
             "a released queue drains normally"
@@ -2710,6 +2896,7 @@ mod tests {
             Action::SendPromptNow {
                 text: "hurry".into(),
                 images: vec![],
+                image_notice: None,
             },
             &mut app,
         );
@@ -3120,7 +3307,11 @@ mod tests {
         enqueue_local(&mut app, id, "check status");
 
         // A drain while loading_replay is true must be blocked
-        let effects = maybe_drain_queue(app.agents.get_mut(&id).unwrap()).effects;
+        let effects = maybe_drain_queue(
+            app.agents.get_mut(&id).unwrap(),
+            &mut app.pending_image_notices,
+        )
+        .effects;
         assert!(
             effects.is_empty(),
             "drain must be blocked during loading_replay"
@@ -3135,7 +3326,11 @@ mod tests {
         app.agents.get_mut(&id).unwrap().session.loading_replay = false;
 
         // Drain again: it succeeds now
-        let effects = maybe_drain_queue(app.agents.get_mut(&id).unwrap()).effects;
+        let effects = maybe_drain_queue(
+            app.agents.get_mut(&id).unwrap(),
+            &mut app.pending_image_notices,
+        )
+        .effects;
         assert_eq!(effects.len(), 1);
         assert_eq!(
             test_agent(&app, id).session.queue_len(),

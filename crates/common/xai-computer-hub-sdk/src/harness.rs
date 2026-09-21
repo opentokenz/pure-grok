@@ -1164,6 +1164,7 @@ impl ToolHarness {
                     self.inner
                         .last_bind_report
                         .store(Some(Arc::new(SessionBindReport::from(&bind_result))));
+                    connection.record_session_bind(&self.inner.session, req.params);
                     Ok(bind_result)
                 }
                 ResponseOutcome::Error(err) => Err(ClientError::from_jsonrpc_error(err)),
@@ -1264,6 +1265,7 @@ impl ToolHarness {
                 // Clear cached remote tools — the server's tools are no
                 // longer available after unbind.
                 self.inner.remote_tools.store(Arc::new(Vec::new()));
+                connection.forget_session_bind(&self.inner.session, Some(&req.params.server_id));
                 Ok(())
             }
             ResponseOutcome::Error(err) => Err(ClientError::from_jsonrpc_error(err)),
@@ -1289,7 +1291,10 @@ impl ToolHarness {
         };
         let resp = connection.call_request(request_id, &req).await?;
         match resp.outcome {
-            ResponseOutcome::Result(_) => Ok(()),
+            ResponseOutcome::Result(_) => {
+                connection.forget_session_bind(&self.inner.session, None);
+                Ok(())
+            }
             ResponseOutcome::Error(err) => Err(ClientError::from_jsonrpc_error(err)),
         }
     }

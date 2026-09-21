@@ -13,6 +13,7 @@
 //! - `SessionIdResource` — current session ID for parent scoping (optional)
 //! - `SubagentForegroundWait` — host wait-window guard factory (optional)
 //! - `TaskModelValidator` — validates explicit model slugs before spawn
+//! - `Params<TaskParams>` — whether the model may pick a child model (optional)
 
 mod active_message;
 pub mod admission;
@@ -21,6 +22,8 @@ pub mod backend;
 pub mod coordinator;
 mod coordinator_state;
 pub use coordinator_state::{cap_completion_output, completion_summary, terminal_snapshot};
+pub mod model_policy;
+pub use model_policy::TaskParams;
 pub mod root_control;
 pub mod types;
 
@@ -302,6 +305,27 @@ impl crate::types::tool_metadata::ToolMetadata for TaskTool {
         &DESC
     }
 
+    fn versioned_definition(
+        &self,
+        _contract_version: Option<&str>,
+        client_name: &str,
+        description_override: Option<&str>,
+        renderer: &crate::types::template_renderer::TemplateRenderer,
+        param_map: &std::collections::HashMap<String, String>,
+        input_schema: &serde_json::Value,
+        effective_params: &serde_json::Value,
+    ) -> crate::types::definition::ToolDefinition {
+        model_policy::task_versioned_definition(
+            client_name,
+            description_override,
+            self.description_template(),
+            renderer,
+            param_map,
+            input_schema,
+            effective_params,
+        )
+    }
+
     fn requires_expr(&self) -> Expr<ToolRequirement> {
         // The task tool can only be used when both get_task_output
         // (BackgroundTaskAction) and kill_task (KillTaskAction) are present,
@@ -367,6 +391,8 @@ impl xai_tool_runtime::Tool for TaskTool {
             max_depth,
             backend,
             model_validator,
+            model_selection,
+            model_rejection_sink,
             parent_session_id,
             parent_prompt_id,
             foreground_wait,
@@ -387,6 +413,11 @@ impl xai_tool_runtime::Tool for TaskTool {
                 .clone();
 
             let model_validator = res.get::<TaskModelValidator>().cloned();
+            let model_selection = res
+                .get::<crate::types::resources::Params<model_policy::TaskParams>>()
+                .map(|params| params.model_selection)
+                .unwrap_or_default();
+            let model_rejection_sink = res.get::<model_policy::TaskModelRejectionSink>().cloned();
 
             let parent_session_id = res
                 .get::<SessionIdResource>()
@@ -404,6 +435,8 @@ impl xai_tool_runtime::Tool for TaskTool {
                 max_depth,
                 backend,
                 model_validator,
+                model_selection,
+                model_rejection_sink,
                 parent_session_id,
                 parent_prompt_id,
                 foreground_wait,
@@ -456,6 +489,18 @@ impl xai_tool_runtime::Tool for TaskTool {
         } else {
             model
         };
+
+        // Before validation and bootstrap, so a forbidden choice costs no child work
+        if model.is_some() && model_selection == model_policy::TaskModelSelection::Inherited {
+            if let Some(sink) = model_rejection_sink {
+                sink.notify(model_policy::TaskModelRejection::HiddenSelection);
+            }
+            let param_names = crate::types::tool_metadata::invoking_param_names(&ctx);
+            let param_name = param_names.resolve(model_policy::MODEL_PARAM);
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                model_policy::hidden_selection_message(param_name),
+            ));
+        }
 
         // Treat blank/empty/"null" cwd as absent (models sometimes emit these).
         // Also strip stray surrounding quote characters and expand `~`.
@@ -606,7 +651,9 @@ impl xai_tool_runtime::Tool for TaskTool {
             cwd,
             runtime_overrides: SubagentRuntimeOverrides {
                 model,
-                model_override_provenance: ModelOverrideProvenance::Tool,
+                model_override_provenance: ModelOverrideProvenance::Tool {
+                    selection: model_selection,
+                },
                 reasoning_effort: None,
                 persona: None,
                 // JSON cannot set this field. Compat-harness adapters still
@@ -863,6 +910,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -924,6 +972,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -958,6 +1007,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -989,6 +1039,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -1047,6 +1098,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -1103,6 +1155,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -1146,6 +1199,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -1254,6 +1308,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            workspace: None,
             task_id: None,
         }
     }
@@ -1892,6 +1947,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: Some("test-model".into()),
+            workspace: None,
             task_id: Some("task-123".into()),
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -2173,6 +2229,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            workspace: None,
             task_id: None,
         })
         .unwrap();
@@ -2222,6 +2279,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2258,6 +2316,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            workspace: None,
             task_id: None,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -2304,6 +2363,7 @@ mod tests {
                 resume_from: Some("prev-id".into()),
                 cwd: None,
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2370,6 +2430,7 @@ mod tests {
                     resume_from: Some(sentinel.into()),
                     cwd: None,
                     model: None,
+                    workspace: None,
                     task_id: None,
                 },
             )
@@ -2416,6 +2477,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            workspace: None,
             task_id: None,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -2444,6 +2506,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/tmp".into()),
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2498,6 +2561,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("".into()),
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2548,6 +2612,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("null".into()),
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2598,6 +2663,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("  ".into()),
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2651,6 +2717,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2685,6 +2752,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2740,6 +2808,7 @@ mod tests {
                     resume_from: None,
                     cwd: Some(sentinel.into()),
                     model: None,
+                    workspace: None,
                     task_id: None,
                 },
             )
@@ -2793,6 +2862,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/tmp".into()),
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2850,6 +2920,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("\"/tmp".into()),
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2902,6 +2973,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/tmp".into()),
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2950,6 +3022,7 @@ mod tests {
                 resume_from: Some("prev-id".into()),
                 cwd: Some("/tmp/some-dir".into()),
                 model: None,
+                workspace: None,
                 task_id: None,
             },
         )
@@ -2982,7 +3055,9 @@ mod tests {
             );
             assert_eq!(
                 request.runtime_overrides.model_override_provenance,
-                ModelOverrideProvenance::Tool,
+                ModelOverrideProvenance::Tool {
+                    selection: model_policy::TaskModelSelection::Selectable,
+                },
             );
             assert!(request.runtime_overrides.reasoning_effort.is_none());
             assert!(request.runtime_overrides.persona.is_none());
@@ -3152,7 +3227,9 @@ mod tests {
             );
             assert_eq!(
                 request.runtime_overrides.model_override_provenance,
-                ModelOverrideProvenance::Tool,
+                ModelOverrideProvenance::Tool {
+                    selection: model_policy::TaskModelSelection::Selectable,
+                },
             );
             assert!(request.runtime_overrides.reasoning_effort.is_none());
             assert!(request.runtime_overrides.persona.is_none());

@@ -1731,6 +1731,7 @@ fn test_connection() -> (Arc<HubConnection>, Arc<Demux>, mpsc::Receiver<String>)
         outbound_tx,
         demux: demux.clone(),
         bound_sessions: Arc::new(RefCountedSet::new()),
+        last_binds: dashmap::DashMap::new(),
         session_lifecycle: parking_lot::Mutex::new(()),
         connection_id: Arc::new(Mutex::new(None)),
         hello_capabilities: parking_lot::RwLock::new(Vec::new()),
@@ -1770,6 +1771,80 @@ fn classify_stream_end_prefers_recorded_write_error() {
         classify_stream_end(inner, Some("reset".to_owned())),
         DisconnectCause::WriteError(_)
     ));
+}
+/// One replay entry per tool server; unbinding one keeps the rest, unbinding
+/// the last drops the key, and a close drops them all.
+#[test]
+fn recorded_binds_follow_bind_unbind_and_close() {
+    let (conn, _demux, _outbound_rx) = test_connection();
+    let session = SessionId::new("binds").expect("valid");
+    let bind = |server: &str, cwd: Option<&str>| SessionBindServerParams {
+        server_id: ServerId::new(server).expect("valid"),
+        cwd: cwd.map(str::to_owned),
+        metadata: None,
+    };
+    let recorded = |conn: &HubConnection| {
+        conn.inner
+            .last_binds
+            .get(&session)
+            .map(|binds| binds.clone())
+            .unwrap_or_default()
+    };
+    conn.record_session_bind(&session, bind("a", None));
+    conn.record_session_bind(&session, bind("b", None));
+    conn.record_session_bind(&session, bind("a", Some("/re-bound")));
+    assert_eq!(
+        vec![bind("b", None), bind("a", Some("/re-bound"))],
+        recorded(&conn)
+    );
+    conn.forget_session_bind(&session, Some(&ServerId::new("b").expect("valid")));
+    assert_eq!(vec![bind("a", Some("/re-bound"))], recorded(&conn));
+    conn.forget_session_bind(&session, Some(&ServerId::new("a").expect("valid")));
+    assert!(!conn.inner.last_binds.contains_key(&session));
+    conn.record_session_bind(&session, bind("a", None));
+    conn.forget_session_bind(&session, None);
+    assert!(!conn.inner.last_binds.contains_key(&session));
+}
+/// Forgetting the last server of a session must not take a bind recorded
+/// concurrently down with it: the key is removed only if the entry is still
+/// empty at removal time. Correct code cannot fail this; an unconditional
+/// remove loses `b` on some interleaving.
+#[test]
+fn forgetting_the_last_server_keeps_a_concurrently_recorded_bind() {
+    let (conn, _demux, _outbound_rx) = test_connection();
+    let session = SessionId::new("binds-race").expect("valid");
+    let server = |name: &str| ServerId::new(name).expect("valid");
+    for _ in 0..2_000 {
+        conn.record_session_bind(
+            &session,
+            SessionBindServerParams {
+                server_id: server("a"),
+                cwd: None,
+                metadata: None,
+            },
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(|| conn.forget_session_bind(&session, Some(&server("a"))));
+            scope.spawn(|| {
+                conn.record_session_bind(
+                    &session,
+                    SessionBindServerParams {
+                        server_id: server("b"),
+                        cwd: None,
+                        metadata: None,
+                    },
+                )
+            });
+        });
+        let remaining: Vec<ServerId> = conn
+            .inner
+            .last_binds
+            .get(&session)
+            .map(|binds| binds.iter().map(|b| b.server_id.clone()).collect())
+            .unwrap_or_default();
+        assert_eq!(vec![server("b")], remaining);
+        conn.forget_session_bind(&session, None);
+    }
 }
 #[test]
 fn supports_is_unknown_until_capabilities_advertised() {

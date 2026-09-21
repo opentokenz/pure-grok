@@ -153,7 +153,7 @@ impl coordinator::ChildRunner for ShellChildRunner {
                 );
                 ctx.parent_mcp_pool = pool;
                 ctx.client_hooks = hooks;
-                ctx.parent_tool_definitions = (!definitions.is_empty()).then_some(definitions);
+                ctx.parent_tool_definitions = definitions;
             }
             if let Some(spawner) = spawner_session_id.as_deref() {
                 if this.is_resident(&acp::SessionId::new(spawner)) {

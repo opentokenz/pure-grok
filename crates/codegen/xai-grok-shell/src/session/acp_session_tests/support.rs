@@ -146,7 +146,7 @@ async fn test_agent_from_config(
     use xai_grok_tools::computer::types::AsyncFileSystem;
     use xai_grok_tools::notification::ToolNotificationHandle;
     use xai_grok_tools::registry::types::SessionContext;
-    let builder = crate::tools::bridge::ToolBridge::get_builder();
+    let builder = crate::tools::bridge::ToolBridge::get_builder().with_mcp_file_input_preparation();
     let fs: std::sync::Arc<dyn AsyncFileSystem> = std::sync::Arc::new(LocalFs);
     let ctx = SessionContext {
         backend,
@@ -332,8 +332,7 @@ async fn create_test_actor_inner(
     );
     chat_state_handle.record_token_usage(total_tokens);
     let actor = SessionActor {
-        repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(
-        ),
+        vcs_root: None,
         transient_retry_enabled: true,
         transient_retries_prompt_total: std::cell::Cell::new(0),
         transient_episode_start: std::cell::Cell::new(None),
@@ -396,6 +395,10 @@ async fn create_test_actor_inner(
             configured_mode: None,
             v2_config: Default::default(),
             configured_storage: None,
+            process_disabled: false,
+            config_opt_out: false,
+            v2_legacy_carryover: false,
+            prompt_sync_pending: std::sync::atomic::AtomicBool::new(false),
             flush_config: crate::config::MemoryFlushConfig::default(),
             is_flushing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capture_worker: std::cell::RefCell::new(None),
@@ -515,7 +518,6 @@ async fn create_test_actor_inner(
         turn_end_tx: Default::default(),
         client_hooks: Default::default(),
         hook_resolved_workspace_root: String::new(),
-        vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
         hook_load_errors: std::cell::RefCell::new(Vec::new()),
         plugin_registry: std::cell::RefCell::new(None),
         plugin_registry_handle: None,
@@ -1140,6 +1142,12 @@ pub(crate) fn spawn_capturing_gateway_loop(
 }
 #[cfg(test)]
 pub(crate) async fn actor_with_persistence_drain() -> std::sync::Arc<SessionActor> {
+    actor_with_persistence_drain_and_sampler(xai_grok_sampler::SamplerHandle::noop()).await
+}
+#[cfg(test)]
+pub(crate) async fn actor_with_persistence_drain_and_sampler(
+    sampler: xai_grok_sampler::SamplerHandle,
+) -> std::sync::Arc<SessionActor> {
     let (gateway_tx, mut gateway_rx) =
         tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
     tokio::task::spawn_local(async move { while gateway_rx.recv().await.is_some() {} });
@@ -1152,7 +1160,7 @@ pub(crate) async fn actor_with_persistence_drain() -> std::sync::Arc<SessionActo
             }
         }
     });
-    let (actor, _) = create_test_actor_with_terminal(
+    let (mut actor, _) = create_test_actor_with_terminal(
         0,
         256_000,
         85,
@@ -1161,6 +1169,7 @@ pub(crate) async fn actor_with_persistence_drain() -> std::sync::Arc<SessionActo
         Arc::new(DummyTerminal),
     )
     .await;
+    actor.sampler_handle = sampler;
     std::sync::Arc::new(actor)
 }
 /// Fresh per-step transient-retry state for direct `handle_sampling_failure` calls: `step_attempts` used, full turn budget, no open episode.

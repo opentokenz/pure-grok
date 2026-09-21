@@ -16,6 +16,7 @@ use super::notify::WorkflowNotifySender;
 use super::registry::{ResolvedWorkflow, WorkflowSource};
 use super::store::WorkflowRunStore;
 use super::tracker::{WorkflowRunState, WorkflowRunStatus, WorkflowTracker};
+use crate::agent::remote_config::task_model_policy::LatchedTaskModelSelection;
 
 pub(crate) const WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION: usize = 4;
 pub(crate) const WORKFLOW_DEFAULT_AGENT_BUDGET: u64 = xai_workflow::DEFAULT_AGENT_BUDGET;
@@ -92,6 +93,8 @@ pub(crate) struct WorkflowManager {
     active: HashMap<String, ActiveRun>,
     retiring: Vec<(String, oneshot::Receiver<()>)>,
     max_concurrent_agents: usize,
+    /// `agent()` spawns carry the owning session's mode instead of reclassifying.
+    task_model_selection: LatchedTaskModelSelection,
 }
 
 impl WorkflowManager {
@@ -111,6 +114,7 @@ impl WorkflowManager {
         session_cmd_tx: mpsc::UnboundedSender<crate::session::commands::SessionCommand>,
         templates: HashMap<String, String>,
         max_concurrent_agents: usize,
+        task_model_selection: LatchedTaskModelSelection,
     ) -> Self {
         Self {
             session_id,
@@ -129,6 +133,7 @@ impl WorkflowManager {
             max_concurrent_agents: super::host_service::workflow_max_concurrent_agents(
                 max_concurrent_agents,
             ),
+            task_model_selection,
         }
     }
 
@@ -311,6 +316,7 @@ impl WorkflowManager {
                 telemetry: self.telemetry.clone(),
                 stats: agent_stats.clone(),
                 cancel: cancel.clone(),
+                task_model_selection: self.task_model_selection.clone(),
             },
             host_rx,
         );
@@ -535,6 +541,7 @@ impl WorkflowManager {
             mpsc::unbounded_channel().0,
             std::collections::HashMap::new(),
             super::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
+            LatchedTaskModelSelection::default(),
         )));
         (manager, tracker)
     }
@@ -956,6 +963,7 @@ mod tests {
             mpsc::unbounded_channel().0,
             HashMap::new(),
             crate::session::workflow::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
+            LatchedTaskModelSelection::default(),
         );
         (manager, event_rx, cancels)
     }
@@ -1444,7 +1452,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_spawns_await_to_completion() {
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            ModelOverrideProvenance, SubagentEvent, SubagentResult,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -1472,7 +1480,9 @@ mod tests {
         );
         assert_eq!(
             req.runtime_overrides.model_override_provenance,
-            xai_grok_tools::implementations::grok_build::task::types::ModelOverrideProvenance::Tool,
+            ModelOverrideProvenance::Tool {
+                selection: Default::default(),
+            },
             "script model overrides are untrusted tool provenance"
         );
         assert_eq!(req.runtime_overrides.reasoning_effort, None);

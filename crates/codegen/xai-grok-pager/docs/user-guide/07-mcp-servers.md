@@ -241,6 +241,41 @@ The model has access to two built-in tools for working with MCP servers:
 
 ---
 
+## File-backed MCP arguments
+
+On the Rust-shell local filesystem (Linux, macOS, and Windows), `use_tool` accepts exactly one form:
+
+| Form | Call | File contents |
+|------|------|---------------|
+| Inline | `{"tool_name":"example__update_page","tool_input":{"body":"Hello"}}` | None |
+| Arguments file | `{"tool_name":"example__update_page","tool_input_file":"/tmp/mcp-arguments.json"}` | The complete remote object, such as `{"body":"Hello"}`; it cannot override the target. |
+| Invocation file | `{"file":"/tmp/mcp-call.json"}` | Canonical `{"tool_name":"example__update_page","tool_input":{"body":"Hello"}}`. |
+
+Use a serializer for large documents or servers that require JSON inside a string:
+
+```python
+import json
+from pathlib import Path
+
+body = Path("/tmp/page.html").read_text(encoding="utf-8")
+arguments = {"input": json.dumps({"page_id": "123", "body": body})}
+Path("/tmp/mcp-arguments.json").write_text(json.dumps(arguments), encoding="utf-8")
+Path("/tmp/mcp-call.json").write_text(
+    json.dumps({"tool_name": "example__update_page", "tool_input": arguments}),
+    encoding="utf-8",
+)
+```
+
+Nested JSON strings are not decoded again; remote `file` and `tool_input_file` keys remain server data. Do not mix forms, delegate to another file, or name a native tool. On-disk invocation keys stay canonical even when wrapper parameters are renamed.
+
+Sources must be complete regular UTF-8 JSON objects, at most **8 MiB**. Malformed/trailing JSON, duplicate envelope keys, missing fields, null paths, and non-object invocation arguments are rejected. Each prepared batch permits **16 MiB** of source input and **32 MiB** of serialized effective invocations, including hook rewrites. File operations have a **10-second** deadline excluding permission waits. These limits do not change ordinary read windows, guarantee remote acceptance, or interrupt kernel I/O.
+
+Read authorization and path, memory, symlink, and opted-in ignored-file restrictions apply before loading; transport reads do not satisfy read-before-edit. Target hooks then see loaded arguments, and separate MCP approval shows the resolved target and source. Hooks may rewrite arguments, not retarget or load another file. Authentication retries reuse the approved snapshot even if the file changes. History retains the authored reference; capped hooks/approvals see effective arguments. Server echoes and hook-added context remain unchanged.
+
+ACP client filesystems do not yet support bounded acquisition and reject file mode without agent-local fallback. File-backed invocation is supported only through Rust-shell `use_tool`; other embedding hosts reject unresolved file inputs, and direct MCP APIs remain unchanged.
+
+---
+
 ## Compatibility
 
 Grok loads MCP server configurations from multiple sources for compatibility:

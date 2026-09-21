@@ -954,6 +954,18 @@ impl AgentView {
                 .copied()
                 .and_then(|item| self.dock_stop_action(item))
                 .map_or(InputOutcome::Unchanged, InputOutcome::Action),
+            KeyCode::Char('y') => {
+                let (col, row) = self.last_mouse_pos;
+                if self.pane_areas.queue.area() > 0
+                    && self.pane_areas.queue.contains((col, row).into())
+                    && let Some((_, text)) = self.queue.yank_copy_target()
+                {
+                    self.copy_to_clipboard(&text);
+                    InputOutcome::Changed
+                } else {
+                    InputOutcome::Unchanged
+                }
+            }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.set_active_pane(AgentPane::Scrollback, false);
                 InputOutcome::Changed

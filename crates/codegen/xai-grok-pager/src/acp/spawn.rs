@@ -1,4 +1,4 @@
-//! Agent spawning — creates the agent process and ACP channels.
+//! Agent spawning: creates the agent process and ACP channels.
 //!
 //! Simplified to only support GrokShell (in-process) mode.
 //! Subprocess and remote modes can be added later if needed.
@@ -81,7 +81,7 @@ where
 }
 
 /// Bounded worker-runtime teardown; see [`WORKER_RUNTIME_SHUTDOWN_GRACE`].
-/// A timed-out blocking task is abandoned, not cancelled — safe only because
+/// A timed-out blocking task is abandoned, not cancelled, safe only because
 /// the worker exits with the process, which reaps the leftover thread.
 pub(super) fn shutdown_worker_runtime(rt: tokio::runtime::Runtime) {
     let shutdown_span = xai_grok_telemetry::region::Region::from_span(tracing::info_span!(
@@ -100,15 +100,15 @@ pub(super) fn shutdown_worker_runtime(rt: tokio::runtime::Runtime) {
 const JOIN_NOTICE_AFTER: Duration = Duration::from_millis(1500);
 
 /// Stderr notice after a slow join. Covers the whole SessionEnd pipeline
-/// (hooks, telemetry sync, upload drain, memory, optional dream) — not
+/// (hooks, telemetry sync, upload drain, memory, optional dream), not
 /// hooks alone, so the copy is intentionally not "session hooks".
 const JOIN_NOTICE: &str = "Finishing session…";
 
 /// Result of spawning a child agent.
 pub struct SpawnedAgent {
     /// Agent worker OS thread. Hand to [`AgentShutdownGuard`] so the worker is
-    /// cancelled and joined — letting session actors finish SessionEnd teardown
-    /// (hooks, telemetry, uploads, memory) — on every exit path.
+    /// cancelled and joined, letting session actors finish SessionEnd teardown
+    /// (hooks, telemetry, uploads, memory), on every exit path.
     pub thread_handle: thread::JoinHandle<Result<()>>,
     pub channel: AcpClientChannel,
     pub cancel: CancellationToken,
@@ -233,7 +233,7 @@ fn classify_join(result: thread::Result<Result<()>>) -> JoinOutcome {
     }
 }
 
-/// Render a panic payload as text — `panic!` payloads are `&str` or `String`,
+/// Render a panic payload as text. `panic!` payloads are `&str` or `String`,
 /// so the log shows the message instead of an opaque `Any`.
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -248,7 +248,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// Auth manager for the embedded shell: construction and refresher wiring
 /// only. The proactive refresh loop starts in [`spawn_grok_shell`]'s body on
 /// `agent_cancel`, so a failed spawn cannot leak it.
-pub(super) fn boot_auth_manager(
+pub(crate) fn boot_auth_manager(
     home: &std::path::Path,
     agent_config: &AgentConfig,
 ) -> std::sync::Arc<AuthManager> {
@@ -278,7 +278,7 @@ pub async fn spawn_grok_shell(
 
     let agent_cancel = cancel.child_token();
 
-    // With no leader, this process owns token refresh — a turn parked on the uncharged 401 path never drives refreshes
+    // With no leader, this process owns token refresh; a turn parked on the uncharged 401 path never drives refreshes
     // itself and relies on this loop. On `agent_cancel` so the loop dies with the agent instead of surviving a failed
     // spawn.
     auth_manager.start_proactive_refresh(agent_cancel.child_token());

@@ -199,8 +199,10 @@ pub enum ModelOverrideProvenance {
     /// Internal harness, role, persona, or config resolution.
     #[default]
     Harness,
-    /// A model-facing `Task.model` argument.
-    Tool,
+    /// A model-facing task call, carrying the selection mode its tool schema advertised.
+    Tool {
+        selection: super::model_policy::TaskModelSelection,
+    },
 }
 
 #[derive(Debug, Clone, Default)]

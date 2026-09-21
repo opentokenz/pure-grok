@@ -908,6 +908,17 @@ async fn persist_setting_type_mismatch_errors_show_timeline() {
         );
 }
 #[tokio::test]
+async fn persist_setting_type_mismatch_errors_dashboard_preview() {
+    use crate::settings::SettingValue;
+    let error = persist_setting(
+            "dashboard_preview",
+            SettingValue::String("nope".to_owned()),
+        )
+        .await
+        .expect_err("dashboard preview rejects a non-boolean value");
+    assert!(error.contains("persist_setting(dashboard_preview) expected Bool"), "{error}");
+}
+#[tokio::test]
 async fn persist_setting_type_mismatch_errors_page_flip_on_send() {
     use crate::settings::SettingValue;
     let r = persist_setting("page_flip_on_send", SettingValue::String("nope".into()))

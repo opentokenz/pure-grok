@@ -209,6 +209,8 @@ pub(crate) enum EnforcedSetting {
     ProjectMcpServers,
     /// `plugin_auto_update = false` pin: session-start plugin auto-update off.
     PluginAutoUpdate,
+    /// `allow_managed_hooks_only = true` pin: hooks that are not managed policy do not run.
+    NonManagedHooks,
 }
 
 #[derive(Debug, Serialize)]
@@ -776,6 +778,7 @@ fn permission_policy_report(
     for (pin, setting) in [
         (&ms.project_mcp, EnforcedSetting::ProjectMcpServers),
         (&ms.plugin_auto_update, EnforcedSetting::PluginAutoUpdate),
+        (&ms.non_managed_hooks, EnforcedSetting::NonManagedHooks),
     ] {
         if let Some(source) = pin.source() {
             enforced.push(EnforcedPolicy {
@@ -1413,6 +1416,7 @@ fn enforced_label(p: &EnforcedPolicy) -> String {
         EnforcedSetting::Feedback => "Feedback",
         EnforcedSetting::ProjectMcpServers => "Project MCP servers",
         EnforcedSetting::PluginAutoUpdate => "Plugin auto-update",
+        EnforcedSetting::NonManagedHooks => "Hooks outside managed policy",
     };
     let state = if p.enabled { "enabled" } else { "disabled" };
     format!("{name} {state}")
@@ -2206,6 +2210,13 @@ mod tests {
             "Permissions mode: always-approve disabled"
         );
         assert!(!enforced_label(&p).contains("yolo"));
+
+        let p = EnforcedPolicy {
+            setting: EnforcedSetting::NonManagedHooks,
+            enabled: false,
+            source: "requirements.toml".into(),
+        };
+        assert_eq!(enforced_label(&p), "Hooks outside managed policy disabled");
     }
 
     fn permissions_report(
@@ -2392,6 +2403,10 @@ mod tests {
             source: "/etc/grok/requirements.toml".into(),
             ownership: PolicyLayerOwnership::Admin,
         };
+        ms.non_managed_hooks = PolicyPin::Disabled {
+            source: "/Users/me/.grok/requirements.toml".into(),
+            ownership: PolicyLayerOwnership::User,
+        };
         let PermissionPolicyReport { enforced, .. } = permission_policy_report(&ms, None);
         assert_eq!(
             serde_json::to_value(&enforced).unwrap(),
@@ -2405,6 +2420,11 @@ mod tests {
                     "setting": "pluginAutoUpdate",
                     "enabled": false,
                     "source": "/etc/grok/requirements.toml",
+                },
+                {
+                    "setting": "nonManagedHooks",
+                    "enabled": false,
+                    "source": "/Users/me/.grok/requirements.toml",
                 },
             ])
         );
@@ -2588,18 +2608,18 @@ mod tests {
         );
         login.plugin_name = Some("acme".into());
         let deploy = skill_fixture("deploy", "/tmp/deploy/SKILL.md", SkillScope::Local);
-        // Gated builtins like /flush stay untagged: inspect must not invent /local:flush while the live catalog may still advertise /flush
-        let flush = skill_fixture("flush", "/tmp/flush/SKILL.md", SkillScope::Local);
+        // Gated builtins like /goal stay untagged: inspect must not invent /local:goal while the live catalog may still advertise /goal
+        let goal = skill_fixture("goal", "/tmp/goal/SKILL.md", SkillScope::Local);
         let commit_local = skill_fixture("commit", "/tmp/l/commit/SKILL.md", SkillScope::Local);
         let commit_user = skill_fixture("commit", "/tmp/u/commit/SKILL.md", SkillScope::User);
-        let all = [login, deploy, flush, commit_local, commit_user];
-        let [login, deploy, flush, commit_local, commit_user] = &all;
+        let all = [login, deploy, goal, commit_local, commit_user];
+        let [login, deploy, goal, commit_local, commit_user] = &all;
 
         let entry = collision_entry(login, &all);
         assert_eq!(entry.collides_with.as_deref(), Some("login"));
         assert_eq!(entry.invocable_as.as_deref(), Some("acme:login"));
 
-        for skill in [deploy, flush] {
+        for skill in [deploy, goal] {
             let entry = collision_entry(skill, &all);
             assert_eq!(entry.collides_with, None, "{}", skill.name);
             assert_eq!(entry.invocable_as, None, "{}", skill.name);

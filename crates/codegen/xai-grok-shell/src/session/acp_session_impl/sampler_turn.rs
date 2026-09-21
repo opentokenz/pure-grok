@@ -428,10 +428,26 @@ impl SessionActor {
         let bridge = self.agent.borrow().tool_bridge().clone();
 
         // Local mode: tool search is always enabled
-        let defs = bridge.tool_definitions_builtins_only().await;
+        let defs = if self.mcp_file_forms_hidden().await {
+            bridge.tool_definitions_builtins_only_inline_mcp().await
+        } else {
+            bridge.tool_definitions_builtins_only().await
+        };
 
         let plan_active = self.plan_mode.lock().is_active();
         filter_cursor_tools_by_plan_mode(defs, plan_active)
+    }
+
+    /// Messages-backed models never see `use_tool`'s file forms: the Anthropic Messages API rejects the schema's
+    /// root-level union (`oneOf`) with HTTP 400, which fails every turn. Checked per request because a model switch
+    /// mid-session keeps the finalized toolset.
+    pub(crate) async fn mcp_file_forms_hidden(&self) -> bool {
+        self.chat_state_handle
+            .get_sampling_config()
+            .await
+            .is_some_and(|config| {
+                config.api_backend == xai_grok_sampling_types::ApiBackend::Messages
+            })
     }
 
     pub(super) fn model_auth_facts(&self, model_id: &str) -> crate::agent::config::ModelAuthFacts {
@@ -1278,7 +1294,11 @@ impl SessionActor {
         // Telemetry and notification for terminal failures
         // The drainer already recorded `record_error_typed` from the `SamplingEvent::Failed` event
         // Here we send the `RetryState::Failed` notification, which the drainer intentionally skips because it would fire mid-retry
-        let detailed_message = error.message.clone();
+        let detailed_message = if error.kind == SamplingErrorKind::IdleTimeout {
+            crate::sampling::error::idle_timeout_user_message(self.inference_idle_timeout.as_secs())
+        } else {
+            error.message.clone()
+        };
 
         // 2. Encrypted-content mismatch: friendly error, no retry.
         //    Detect via the BadRequest and "encrypted_content" message pattern that `SamplingError::is_encrypted_content_error` used in the legacy path

@@ -121,8 +121,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             });
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let actor = SessionActor {
-                repo_status_prefetch:
-                    crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
+                vcs_root: None,
                 transient_retry_enabled: true,
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
@@ -205,6 +204,10 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     configured_mode: None,
                     v2_config: Default::default(),
                     configured_storage: None,
+                    process_disabled: false,
+                    config_opt_out: false,
+                    v2_legacy_carryover: false,
+                    prompt_sync_pending: std::sync::atomic::AtomicBool::new(false),
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     capture_worker: std::cell::RefCell::new(None),
@@ -327,7 +330,6 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
-                vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
                 hook_load_errors: std::cell::RefCell::new(Vec::new()),
                 plugin_registry: std::cell::RefCell::new(None),
                 plugin_registry_handle: None,

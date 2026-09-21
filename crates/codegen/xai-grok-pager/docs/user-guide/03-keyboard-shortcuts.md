@@ -462,6 +462,24 @@ Clear (idle):     Esc Esc within 800ms (non-empty prompt)
 Rewind (idle):    Esc Esc within 800ms (empty prompt + messages)
 ```
 
+The composer footer shows the newline chord next to `Enter:send` (or
+`Enter:queue` while a turn is running) once the draft is non-empty
+(including `/btw` and other arg-required slash commands). Over SSH, old
+tmux, or terminals that cannot tell Shift+Enter from Enter, the footer
+prefers `Alt+Enter`.
+
+`Cmd+Enter` is not an advertised send or newline chord. Many terminals
+bind it to fullscreen, so `SUPER` is excluded from the Shift/Alt newline
+matcher and from the agent's bare-Enter send binding. When a terminal
+that speaks the Kitty keyboard protocol delivers `SUPER+Enter`, the
+composer still inserts a newline: the key misses send and lands in the
+textarea, which treats any Enter as a line break. Apple Terminal is a
+separate local path: CoreGraphics rescue treats held Cmd as modified
+Enter and inserts a newline on what arrives as bare Enter. Over SSH the
+Cmd/`SUPER` modifier never arrives (iTerm2 + tmux included), so the
+chord looks like bare Enter and sends. Remotely, use `Alt+Enter`, a
+trailing `\` then Enter, or `/ml`.
+
 With a selection active, typing / `Enter` / paste replace it, delete and
 word-kill chords delete just the selection, arrows collapse it to the
 matching edge (word/line moves continue from that edge), and `Esc` or `Tab`
@@ -487,7 +505,11 @@ focused the same chords jump between turns (see Navigation above).
 > prompt selects every character in the prompt buffer, including pasted
 > image chips. Image chips are always path-free (`[Image #N]`); the
 > filepath (when known) appears only in the image preview overlay on
-> hover or when the cursor is on/right after the chip.
+> hover or when the cursor is on/right after the chip. `[Image #N]` text
+> that comes back as plain text (Ctrl+K then Ctrl+Y, undo, a plain-text
+> paste) re-attaches as a chip while the composer still holds the image;
+> a placeholder for an image it no longer holds is sent as text with a
+> toast saying so.
 
 ### Always available
 

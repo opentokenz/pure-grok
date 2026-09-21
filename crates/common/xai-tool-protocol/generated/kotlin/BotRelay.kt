@@ -127,6 +127,17 @@ data class BotTranscriptOffboxResult(
     @EncodeDefault(EncodeDefault.Mode.NEVER) val nextCursor: String? = null,
 )
 
+/**
+ * Fields the hub merges into every transcript entry it decodes from the
+ * durable store — `getAgentTranscriptTail` / window / thread reads and
+ * `transcript` events alike — next to the box's own fields. Entries the box
+ * answers directly carry none of them.
+ */
+@Serializable
+data class BotTranscriptEntryStamp(
+    val entryVersion: Long,
+)
+
 typealias BotUsageParams = BotEmptyParams
 
 /**
@@ -182,6 +193,18 @@ data class BotBindConversationParams(
 )
 
 typealias BotBindConversationResult = BotEmptyResult
+
+/**
+ * `bot.presence` params. A connection views at most one agent; `viewing:
+ * true` for a new agent replaces the previous one.
+ */
+@Serializable
+data class BotPresenceParams(
+    val agentId: String,
+    val viewing: Boolean,
+)
+
+typealias BotPresenceResult = BotEmptyResult
 
 /**
  * Closed hub-owned error code. This list is the client stability boundary.
@@ -312,6 +335,8 @@ data class BotRelayError(
  */
 @Serializable
 enum class HubChannel {
+    @SerialName("hub:turn_started")
+    TurnStarted,
     @SerialName("hub:turn_finished")
     TurnFinished,
     @SerialName("hub:resync_required")
@@ -319,13 +344,31 @@ enum class HubChannel {
 }
 
 /**
+ * Body of `hub:turn_started` (`event` when [`HubChannel::TurnStarted`]).
+ *
+ * The hub mints `turn_id` when it sees the agent's `isRunning` level rise
+ * and repeats it on the matching [`HubTurnFinishedEvent`], so a client can
+ * tell which running span a finish closes. A subscriber joining mid-turn
+ * receives the running turn's start first.
+ */
+@Serializable
+data class HubTurnStartedEvent(
+    val agentId: String,
+    val turnId: String,
+)
+
+/**
  * Body of `hub:turn_finished` (`event` when [`HubChannel::TurnFinished`]).
+ *
+ * `turn_id` matches the [`HubTurnStartedEvent`] that opened the span;
+ * empty from hubs that predate turn ids.
  */
 @Serializable
 data class HubTurnFinishedEvent(
     val agentId: String,
     val conversationIds: List<String>,
     val preview: String,
+    val turnId: String,
 )
 
 /**
@@ -349,6 +392,7 @@ data class HubResyncRequiredEvent(
  * omitted from the wire when `None`.
  *
  * `event` is upstream-verbatim for [`BotEventChannel::Upstream`]. For
+ * [`HubChannel::TurnStarted`] it is [`HubTurnStartedEvent`]; for
  * [`HubChannel::TurnFinished`] it is [`HubTurnFinishedEvent`]; for
  * [`HubChannel::ResyncRequired`] it is [`HubResyncRequiredEvent`].
  *
@@ -404,6 +448,8 @@ const val COMMAND_REJECTED_BOX_REFUSED: String = "box_refused"
 const val COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD: String = "gateway/unknown-method"
 /** `reason` on `command_rejected` when the target agent's harness owns this state and exposes no RPC for the operation. */
 const val COMMAND_REJECTED_TEMPORAL_UNSUPPORTED: String = "temporal_unsupported"
+/** `reason` on `command_rejected` when the upstream answered the voice mint with `invalid_argument` or a voice harness call with `not_found`: voice calling is not enabled for this account, or the mint was refused. */
+const val COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE: String = "voice_call_unavailable"
 
 fun isGatewayMethodUnsupported(error: BotRelayError): Boolean =
     error.code == "command_rejected" &&

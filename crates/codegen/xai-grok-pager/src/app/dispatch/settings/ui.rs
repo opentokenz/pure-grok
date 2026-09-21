@@ -352,12 +352,24 @@ pub(in crate::app::dispatch) fn dispatch_confirm_reset_setting(
                 return vec![];
             };
             let default_value = crate::settings::default_value_for(meta);
+            let Some(action) = action_for_reset(key, &default_value) else {
+                tracing::error!(
+                    target: "settings",
+                    key,
+                    ?default_value,
+                    "reset has no action_for_reset arm — registry/dispatch skew",
+                );
+                return vec![];
+            };
 
             // Gate idempotent reset: a value already at its default only shows a toast
+            // Not for the coding-data setter, which owns that decision: its local "opt-out" may be the unconfirmed fail-safe, so it writes anyway
             let pager_snapshot = build_pager_snapshot(app);
             let current_value =
                 crate::settings::current_value_for(key, &app.current_ui, &pager_snapshot);
-            if current_value.as_ref() == Some(&default_value) {
+            if current_value.as_ref() == Some(&default_value)
+                && !matches!(action, Action::SetCodingDataSharing { .. })
+            {
                 tracing::debug!(
                     target: "settings",
                     key,
@@ -370,15 +382,6 @@ pub(in crate::app::dispatch) fn dispatch_confirm_reset_setting(
                 return vec![];
             }
 
-            let Some(action) = action_for_reset(key, &default_value) else {
-                tracing::error!(
-                    target: "settings",
-                    key,
-                    ?default_value,
-                    "reset has no action_for_reset arm — registry/dispatch skew",
-                );
-                return vec![];
-            };
             tracing::info!(
                 target: "settings",
                 key,
@@ -633,6 +636,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("show_timestamps", SettingValue::Bool(b)) => Some(Action::SetTimestamps(*b)),
         ("show_timeline", SettingValue::Bool(b)) => Some(Action::SetTimeline(*b)),
         ("page_flip_on_send", SettingValue::Bool(b)) => Some(Action::SetPageFlipOnSend(*b)),
+        ("dashboard_preview", SettingValue::Bool(enabled)) => {
+            Some(Action::SetDashboardPreview(*enabled))
+        }
         ("confirm_before_rewind", SettingValue::Bool(b)) => {
             Some(Action::SetConfirmBeforeRewind(*b))
         }
@@ -806,6 +812,9 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         ("show_timestamps", SettingValue::Bool(b)) => set_timestamps_inner(app, *b),
         ("show_timeline", SettingValue::Bool(b)) => set_timeline_inner(app, *b),
         ("page_flip_on_send", SettingValue::Bool(b)) => set_page_flip_on_send_inner(app, *b),
+        ("dashboard_preview", SettingValue::Bool(enabled)) => {
+            app.current_ui.dashboard_preview = Some(*enabled);
+        }
         ("confirm_before_rewind", SettingValue::Bool(b)) => {
             set_confirm_before_rewind_inner(app, *b)
         }

@@ -406,8 +406,6 @@ pub struct RemoteSettings {
     pub inference_idle_timeout_secs: Option<u64>,
     #[serde(default)]
     pub subagent_rate_limit_max_attempts: Option<u32>,
-    #[serde(default)]
-    pub repo_status_in_system_prompt: Option<bool>,
     /// Global default MCP startup-handshake timeout (seconds).
     /// It is the lowest-precedence fallback; per-server config, env, and requirements/managed override it.
     #[serde(default)]
@@ -642,6 +640,9 @@ pub struct RemoteSettings {
     /// It is the fallback when no local `[features] subagent_worktree_snapshot` is set in config.toml; absent defaults to disabled.
     #[serde(default)]
     pub subagent_worktree_snapshot_enabled: Option<bool>,
+    /// Remote fallback for `[features] subagent_model_inheritance`; absent or null means off.
+    #[serde(default)]
+    pub subagent_model_inheritance_enabled: Option<bool>,
     /// Gates `image_gen` and `/imagine`. `None` falls through env, `[features]`, then the default (on).
     #[serde(default)]
     pub image_gen_enabled: Option<bool>,

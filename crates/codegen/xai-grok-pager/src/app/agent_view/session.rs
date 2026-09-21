@@ -49,6 +49,8 @@ impl AgentView {
         }
         self.session.session_id = Some(session_id);
         self.session_starting_since = None;
+        self.session_new_phase = None;
+        self.pending_session_id = None;
     }
     /// The top-bar MCP chip shows real server counts only; a `0/0` report renders nothing
     pub(crate) fn mcp_chip_visible(&self) -> bool {
@@ -156,6 +158,10 @@ impl AgentView {
             failed_wake_marker_for: None,
             running_wake_turn: None,
             finished_wake_prompts: HashSet::new(),
+            ended_child_prompt_ids: HashSet::new(),
+            superseded_child_prompt_ids: HashSet::new(),
+            unidentified_child_turn_closed_ms: None,
+            unidentified_child_turn_closed_prompt: None,
             active_pane: ActivePane::Prompt,
             dock_cursor: 0,
             dock_workflows_expanded: true,
@@ -216,6 +222,8 @@ impl AgentView {
             turn_paused_duration: std::time::Duration::ZERO,
             turn_paused_wall: std::time::Duration::ZERO,
             self_interjection_ids: std::collections::HashSet::new(),
+            interjection_painted_blocks: std::collections::HashMap::new(),
+            interjection_retry_images: std::collections::HashMap::new(),
             last_active_at: Some(Instant::now()),
             current_branch: None,
             is_worktree: false,
@@ -367,6 +375,8 @@ impl AgentView {
             overlay_can_cycle: false,
             mcp_init_progress: None,
             session_starting_since: None,
+            session_new_phase: None,
+            pending_session_id: None,
             acp_synced_generation: 0,
             hovered_permission_item: None,
             last_permission_click: None,
@@ -598,6 +608,10 @@ impl AgentView {
         self.late_replay_until = None;
         self.running_wake_turn = None;
         self.finished_wake_prompts.clear();
+        self.ended_child_prompt_ids.clear();
+        self.superseded_child_prompt_ids.clear();
+        self.unidentified_child_turn_closed_ms = None;
+        self.unidentified_child_turn_closed_prompt = None;
         self.pending_cancel_resend = None;
         self.cancel_latency = None;
         self.clear_send_now_expectation();

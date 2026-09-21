@@ -396,6 +396,24 @@ fn session_new_increments_session_count_only() {
 }
 
 #[test]
+fn session_create_timeout_emits_the_timeout_counter() {
+    let stream = build(gates_off());
+    emit_event_into(
+        &stream,
+        &events::SessionCreateFailed {
+            outcome: crate::startup::StartupOutcome::Timeout,
+            stuck_phase: Some("plugin_registry".into()),
+            elapsed_ms: 180_000,
+        },
+    );
+    assert!(exported_events(&stream).is_empty(), "metric-only mapping");
+    assert_eq!(
+        vec!["grok_code.session.create_timeout".to_owned()],
+        exported_metric_names(&stream)
+    );
+}
+
+#[test]
 fn agent_connect_timeout_emits_phase_histogram_and_timeout_counter() {
     let stream = build(gates_off());
     let mut phase_durations_ms = std::collections::BTreeMap::new();
@@ -493,7 +511,6 @@ fn prompt_latency(ttft_ms: Option<u64>, ttfm_ms: Option<u64>) -> events::PromptL
         total_ms: 0,
         mcp_wait_ms: 0,
         tool_collection_ms: 0,
-        repo_status_wait_ms: None,
         model_call_ms: 0,
         pre_model_ms: 0,
         mcp_server_count: 0,

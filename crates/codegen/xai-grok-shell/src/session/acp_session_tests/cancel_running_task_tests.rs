@@ -83,8 +83,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 tokio_util::sync::CancellationToken::new(),
             );
             let actor = Arc::new(SessionActor {
-                repo_status_prefetch:
-                    crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
+                vcs_root: None,
                 transient_retry_enabled: true,
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
@@ -162,6 +161,10 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     configured_mode: None,
                     v2_config: Default::default(),
                     configured_storage: None,
+                    process_disabled: false,
+                    config_opt_out: false,
+                    v2_legacy_carryover: false,
+                    prompt_sync_pending: std::sync::atomic::AtomicBool::new(false),
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     capture_worker: std::cell::RefCell::new(None),
@@ -284,7 +287,6 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
-                vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
                 hook_load_errors: std::cell::RefCell::new(Vec::new()),
                 plugin_registry: std::cell::RefCell::new(None),
                 plugin_registry_handle: None,
@@ -621,8 +623,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
             };
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
             let actor = Arc::new(SessionActor {
-                repo_status_prefetch:
-                    crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
+                vcs_root: None,
                 transient_retry_enabled: true,
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
@@ -700,6 +701,10 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     configured_mode: Some(crate::config::MemoryMode::Legacy),
                     v2_config: Default::default(),
                     configured_storage: None,
+                    process_disabled: false,
+                    config_opt_out: false,
+                    v2_legacy_carryover: false,
+                    prompt_sync_pending: std::sync::atomic::AtomicBool::new(false),
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     capture_worker: std::cell::RefCell::new(None),
@@ -825,7 +830,6 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
-                vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
                 hook_load_errors: std::cell::RefCell::new(Vec::new()),
                 plugin_registry: std::cell::RefCell::new(None),
                 plugin_registry_handle: None,
@@ -961,7 +965,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 )
                 .await;
             let actor = SessionActor {
-                repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
+                vcs_root: None,
                 transient_retry_enabled: true,
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
@@ -1035,6 +1039,10 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     configured_mode: None,
                     v2_config: Default::default(),
                     configured_storage: None,
+                    process_disabled: false,
+                    config_opt_out: false,
+                    v2_legacy_carryover: false,
+                    prompt_sync_pending: std::sync::atomic::AtomicBool::new(false),
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::Arc::new(
                         std::sync::atomic::AtomicBool::new(false),
@@ -1176,7 +1184,6 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
-                vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
                 hook_load_errors: std::cell::RefCell::new(Vec::new()),
                 plugin_registry: std::cell::RefCell::new(None),
                 plugin_registry_handle: None,
@@ -2524,7 +2531,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 )
                 .await;
             let actor = SessionActor {
-                repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
+                vcs_root: None,
                 transient_retry_enabled: true,
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
@@ -2598,6 +2605,10 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     configured_mode: None,
                     v2_config: Default::default(),
                     configured_storage: None,
+                    process_disabled: false,
+                    config_opt_out: false,
+                    v2_legacy_carryover: false,
+                    prompt_sync_pending: std::sync::atomic::AtomicBool::new(false),
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::Arc::new(
                         std::sync::atomic::AtomicBool::new(false),
@@ -2739,7 +2750,6 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
-                vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
                 hook_load_errors: std::cell::RefCell::new(Vec::new()),
                 plugin_registry: std::cell::RefCell::new(None),
                 plugin_registry_handle: None,

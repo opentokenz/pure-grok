@@ -26,6 +26,22 @@ use xai_grok_shell::extensions::notification::{
 /// Shared text-selection range id for recap body lines (header is excluded).
 const RECAP_BODY_RANGE: u16 = 0;
 
+/// Which pager-local memory command a [`SessionEvent::MemoryCommandStarted`] marker belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryCommandKind {
+    Flush,
+    Dream,
+}
+
+impl MemoryCommandKind {
+    fn started_text(self) -> &'static str {
+        match self {
+            Self::Flush => "Flushing memory…",
+            Self::Dream => "Consolidating memory…",
+        }
+    }
+}
+
 /// A session-level event with structured data.
 /// Each variant carries the information needed to render a concise, informational message in the scrollback.
 /// These are non-interactive: unselectable, unfoldable, no accent.
@@ -39,17 +55,16 @@ pub enum SessionEvent {
     },
     /// Agent turn was cancelled.
     TurnCancelled {
-        /// Wall-clock elapsed time before cancellation.
-        elapsed: Duration,
-        /// Named from `_meta.cancelTrigger` / `_meta.cancellationCategory`.
+        /// `None` when unknown: do not render `0.0s`.
+        elapsed: Option<Duration>,
         cause: crate::scrollback::blocks::CancelledBy,
     },
     /// Agent turn ended because a hook denied it, today only a `UserPromptSubmit` block (a `PreToolUse` deny feeds back and the turn continues).
     /// Distinct from [`SessionEvent::TurnCancelled`] so the marker never claims the USER cancelled a policy block.
     /// The warning annotation above the marker attributes the hook and reason.
     TurnBlockedByHook {
-        /// Wall-clock elapsed time before the block.
-        elapsed: Duration,
+        /// `None` when unknown: do not render `0.0s`.
+        elapsed: Option<Duration>,
     },
     /// Agent turn was halted by the system (e.g. doom loop detection).
     TurnHalted {
@@ -122,6 +137,16 @@ pub enum SessionEvent {
     /// Manual `/compact` command completed.
     CompactCompleted {
         /// Wall-clock elapsed time for the command.
+        elapsed: Duration,
+    },
+    /// `/flush` or `/dream` started; the invocation marker that pairs each run with its outcome line.
+    /// Local scrollback block only, like [`SessionEvent::CompactStarted`].
+    MemoryCommandStarted { command: MemoryCommandKind },
+    /// `/flush` or `/dream` finished. `summary` comes from the shell's typed response.
+    MemoryCommandCompleted {
+        summary: String,
+        /// False when the run did not achieve what the user asked (failed, timed out, disabled).
+        succeeded: bool,
         elapsed: Duration,
     },
     /// Hook annotation, displayed inline after a tool call.
@@ -354,11 +379,23 @@ impl SessionEvent {
                 format!("Worked for {}", format_duration(*elapsed))
             }
             SessionEvent::TurnCompleted { elapsed: None } => "Turn completed.".to_string(),
-            SessionEvent::TurnCancelled { elapsed, cause } => {
+            SessionEvent::TurnCancelled {
+                elapsed: Some(elapsed),
+                cause,
+            } => {
                 format!("{} in {}.", cause.phrase(), format_duration(*elapsed))
             }
-            SessionEvent::TurnBlockedByHook { elapsed } => {
+            SessionEvent::TurnCancelled {
+                elapsed: None,
+                cause,
+            } => format!("{}.", cause.phrase()),
+            SessionEvent::TurnBlockedByHook {
+                elapsed: Some(elapsed),
+            } => {
                 format!("Turn blocked by a hook in {}.", format_duration(*elapsed))
+            }
+            SessionEvent::TurnBlockedByHook { elapsed: None } => {
+                "Turn blocked by a hook.".to_string()
             }
             SessionEvent::TurnHalted { elapsed } => {
                 format!(
@@ -451,6 +488,21 @@ impl SessionEvent {
             SessionEvent::CompactCompleted { elapsed } => {
                 format!("Compaction completed in {}.", format_duration(*elapsed))
             }
+            SessionEvent::MemoryCommandStarted { command } => command.started_text().to_string(),
+            SessionEvent::MemoryCommandCompleted {
+                summary,
+                succeeded,
+                elapsed,
+            } => {
+                if *succeeded {
+                    format!(
+                        "{summary} ({})  \u{00b7}  /memory to view",
+                        format_duration(*elapsed)
+                    )
+                } else {
+                    summary.clone()
+                }
+            }
             SessionEvent::HookAnnotation { message } | SessionEvent::HookOutcome { message } => {
                 message.clone()
             }
@@ -515,6 +567,10 @@ impl SessionEvent {
                 | SessionEvent::RequestFailed { .. }
                 | SessionEvent::RetryFailed { .. }
                 | SessionEvent::TurnFailed { .. }
+                | SessionEvent::MemoryCommandCompleted {
+                    succeeded: false,
+                    ..
+                }
         )
     }
 
@@ -766,7 +822,7 @@ mod tests {
     #[test]
     fn turn_cancelled_message() {
         let event = SessionEvent::TurnCancelled {
-            elapsed: Duration::from_secs(10),
+            elapsed: Some(Duration::from_secs(10)),
             cause: crate::scrollback::blocks::CancelledBy::User,
         };
         assert_eq!(event.message(), "Turn cancelled by user in 10s.");
@@ -775,7 +831,7 @@ mod tests {
     #[test]
     fn turn_cancelled_message_names_passive_cause() {
         let event = SessionEvent::TurnCancelled {
-            elapsed: Duration::from_secs(10),
+            elapsed: Some(Duration::from_secs(10)),
             cause: crate::scrollback::blocks::CancelledBy::SessionClosed,
         };
         assert_eq!(
@@ -783,7 +839,7 @@ mod tests {
             "Turn cancelled because the session closed in 10s."
         );
         let event = SessionEvent::TurnCancelled {
-            elapsed: Duration::from_secs(4),
+            elapsed: Some(Duration::from_secs(4)),
             cause: crate::scrollback::blocks::CancelledBy::Unspecified,
         };
         assert_eq!(event.message(), "Turn cancelled in 4.0s.");

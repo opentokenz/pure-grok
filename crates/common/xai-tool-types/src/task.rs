@@ -103,6 +103,13 @@ pub struct TaskToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Optional id of the workspace the child runs in. Accepted on the wire
+    /// and ignored locally; omitted from the derived schema, so hosts that
+    /// support it advertise the property themselves.
+    #[schemars(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+
     /// Server-injected before execution. Becomes the subagent's session ID.
     #[schemars(skip)]
     #[serde(default)]
@@ -1426,11 +1433,36 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            workspace: None,
             task_id: None,
         };
         let value = serde_json::to_value(&input).unwrap();
         assert!(value.get("model").is_none());
         assert!(value.get("capability_mode").is_none());
+        assert!(value.get("workspace").is_none());
+    }
+
+    #[test]
+    fn task_tool_input_workspace_defaults_to_none() {
+        let input: TaskToolInput =
+            serde_json::from_str(r#"{"description": "d", "prompt": "p"}"#).unwrap();
+        assert_eq!(None, input.workspace);
+        let input: TaskToolInput = serde_json::from_str(
+            r#"{"description": "d", "prompt": "p", "workspace": "computer-1a2b3c4d"}"#,
+        )
+        .unwrap();
+        assert_eq!(Some("computer-1a2b3c4d"), input.workspace.as_deref());
+    }
+
+    /// The argument is accepted on the wire but is not advertised by the
+    /// derived schema.
+    #[test]
+    fn task_tool_input_schema_hides_workspace() {
+        let schema = serde_json::to_value(schemars::schema_for!(TaskToolInput)).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("model"));
+        assert!(!properties.contains_key("workspace"));
+        assert!(!properties.contains_key("task_id"));
     }
 
     #[test]

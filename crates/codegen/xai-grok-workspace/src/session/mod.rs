@@ -12,7 +12,7 @@ use crate::file_system::{AsyncFsWrapper, LocalFs};
 use crate::hub::{HubConfig, HubHandle};
 use crate::session::file_state::FileStateTracker;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use xai_computer_hub_mcp_adapter::McpBridgeHandle;
@@ -62,6 +62,9 @@ pub(crate) struct ActiveMcp {
     /// session that is in the configured set but currently runs nothing, so
     /// a later reload can add servers to it.
     pub(crate) servers: HashMap<String, SessionMcpServer>,
+    /// Servers stopped while they stay configured: a reload leaves them
+    /// stopped, and the session's next bind starts them again.
+    pub(crate) stopped: HashSet<String>,
 }
 /// Whether a session takes part in the workspace's configured MCP set. `Uninitialized` is a session that never joined: unbound, an `rpc_only` bind, or a bind whose toolset failed to resolve.
 pub(crate) enum WorkspaceMcpBinding {
@@ -93,10 +96,17 @@ impl WorkspaceMcpBinding {
         if matches!(self, Self::Uninitialized) {
             *self = Self::Active(ActiveMcp {
                 servers: HashMap::new(),
+                stopped: HashSet::new(),
             });
         }
         self.active_mut()
     }
+}
+/// How one of a session's MCP servers fared once its start settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerOutcome {
+    Connected,
+    Failed,
 }
 /// Per-session state held in [`WorkspaceShared::sessions`].
 ///
@@ -394,6 +404,32 @@ impl WorkspaceSession {
     }
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+    /// The server's settled start outcome, or `None` while it is still starting. Never waits: a
+    /// status probe reads past a start that holds the lock and reports it as unsettled.
+    pub fn mcp_server_outcome(&self, name: &str) -> Option<McpServerOutcome> {
+        let state = self.mcp_state.try_lock().ok()?;
+        if state.owned_clients.contains_key(name) {
+            Some(McpServerOutcome::Connected)
+        } else if state.init_failed.contains_key(name) {
+            Some(McpServerOutcome::Failed)
+        } else {
+            None
+        }
+    }
+    /// Settles `name` as a start would, for host-crate tests that read the outcome without a server.
+    #[doc(hidden)]
+    pub async fn settle_mcp_server_for_test(&self, name: &str, outcome: McpServerOutcome) {
+        let mut state = self.mcp_state.lock().await;
+        match outcome {
+            McpServerOutcome::Connected => {
+                state.owned_clients.insert(
+                    name.to_owned(),
+                    Arc::new(xai_grok_mcp::servers::McpClient::stub(name)),
+                );
+            }
+            McpServerOutcome::Failed => state.record_init_failure(name, false, None),
+        }
     }
     pub fn cwd(&self) -> &Path {
         self.cwd_override.get().map_or(&self.cwd, PathBuf::as_path)

@@ -257,6 +257,20 @@ impl GrokStdioClient {
         .await
     }
 
+    pub async fn ext_notification(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> acp::Result<()> {
+        timed(
+            &self.process,
+            &format!("ext notify {method}"),
+            self.turn_budget.unwrap_or(REQUEST_TIMEOUT),
+            self.connection.ext_notification(method, params),
+        )
+        .await
+    }
+
     /// Send `session/cancel`, then answer every request this session holds under `HoldUntilCancel` with
     /// `cancelled`. Resolves once every released reply is recorded in the transcript; panics with the agent's
     /// stderr if the notification cannot be sent or a held request is not answered within the request budget.

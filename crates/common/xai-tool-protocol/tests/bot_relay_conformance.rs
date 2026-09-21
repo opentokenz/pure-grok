@@ -14,8 +14,9 @@ use xai_tool_protocol::{
     COMMAND_REJECTED_ATTACHMENT_CREDENTIAL_UNAVAILABLE, COMMAND_REJECTED_ATTACHMENT_NOT_FOUND,
     COMMAND_REJECTED_ATTACHMENT_NOT_READY, COMMAND_REJECTED_ATTACHMENT_TOO_LARGE,
     COMMAND_REJECTED_ATTACHMENT_WRONG_SOURCE, COMMAND_REJECTED_ATTACHMENTS_NOT_SUPPORTED_IN_LIVE,
-    COMMAND_REJECTED_AUDIENCE_UNSUPPORTED, COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD, HubChannel,
-    HubResyncRequiredEvent, HubTurnFinishedEvent,
+    COMMAND_REJECTED_AUDIENCE_UNSUPPORTED, COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD,
+    COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE, HubChannel, HubResyncRequiredEvent,
+    HubTurnFinishedEvent,
 };
 
 const ERROR_IDENTITY_UNAVAILABLE: &str =
@@ -72,6 +73,8 @@ const ERROR_COMMAND_REJECTED_ATTACHMENT_NOT_READY: &str =
     include_str!("../fixtures/bot_relay/error_command_rejected_attachment_not_ready.json");
 const ERROR_COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD: &str =
     include_str!("../fixtures/bot_relay/error_command_rejected_gateway_unknown_method.json");
+const ERROR_COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE: &str =
+    include_str!("../fixtures/bot_relay/error_command_rejected_voice_call_unavailable.json");
 const ERROR_COMPUTER_UNAVAILABLE: &str =
     include_str!("../fixtures/bot_relay/error_computer_unavailable.json");
 const ERROR_UPSTREAM_ERROR: &str = include_str!("../fixtures/bot_relay/error_upstream_error.json");
@@ -466,6 +469,29 @@ fn handwritten_gateway_unknown_method_reason() {
 }
 
 #[test]
+fn handwritten_voice_call_unavailable_reason_keeps_upstream_detail() {
+    let err = assert_error(
+        ERROR_COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE,
+        "command_rejected",
+        false,
+        json!({
+            "upstream": "status=400 connect=invalid_argument",
+            "upstreamMessage": "Voice call is not enabled for this account.",
+        }),
+        Some(COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE),
+        BotRelayErrorCode::CommandRejected,
+    );
+    assert_eq!(
+        Some("status=400 connect=invalid_argument"),
+        err.detail.upstream.as_deref()
+    );
+    assert_eq!(
+        Some("Voice call is not enabled for this account."),
+        err.detail.upstream_message.as_deref()
+    );
+}
+
+#[test]
 fn handwritten_link_conflict_siblings() {
     let (wire, err) = replay_error(ERROR_LINK_CONFLICT_SIBLINGS);
     assert_eq!(wire["code"], "link_conflict");
@@ -551,6 +577,7 @@ fn hub_turn_finished_envelope() {
     assert_eq!(wire["event"]["agentId"], "agt_1");
     assert_eq!(wire["event"]["conversationIds"], json!(["conv_1"]));
     assert_eq!(wire["event"]["preview"], "done");
+    assert_eq!(wire["event"]["turnId"], "turn_7");
     assert!(wire.get("eventId").is_none());
 
     assert_eq!(env.v, 1);
@@ -562,6 +589,7 @@ fn hub_turn_finished_envelope() {
     assert_eq!(body.agent_id, "agt_1");
     assert_eq!(body.conversation_ids, vec!["conv_1".to_owned()]);
     assert_eq!(body.preview, "done");
+    assert_eq!(body.turn_id, "turn_7");
 }
 
 #[test]

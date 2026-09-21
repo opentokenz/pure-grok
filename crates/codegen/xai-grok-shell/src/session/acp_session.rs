@@ -14,6 +14,7 @@ use super::commands::{
 use super::handle::SessionHandle;
 use super::notifications::NotificationSender;
 use crate::agent::update_chunk_merge::{BufferingSettings, ReplayBuffer};
+use crate::extensions::memory::{MemoryDreamDisposition, MemoryDreamResponse};
 use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
 use crate::extensions::notification::{
     HookAnnotationKind, RetryState, SessionNotification as XaiSessionNotification,
@@ -181,6 +182,8 @@ mod length_salvage;
 #[path = "acp_session_impl/sampler_turn.rs"]
 mod sampler_turn;
 use sampler_turn::*;
+#[path = "acp_session_impl/mcp_file_input.rs"]
+mod mcp_file_input;
 #[path = "acp_session_impl/tool_dispatch.rs"]
 mod tool_dispatch;
 use tool_dispatch::*;
@@ -212,10 +215,12 @@ use memory_dream::*;
 mod goal_support;
 #[path = "acp_session_impl/memory_capture.rs"]
 mod memory_capture;
+#[path = "acp_session_impl/memory_carryover.rs"]
+mod memory_carryover;
+#[path = "acp_session_impl/memory_control.rs"]
+mod memory_control;
 #[path = "acp_session_impl/memory_forget.rs"]
 mod memory_forget;
-#[path = "acp_session_impl/memory_status.rs"]
-mod memory_status;
 #[path = "acp_session_impl/v2_memory_dream.rs"]
 mod v2_memory_dream;
 pub(crate) use goal_support::*;
@@ -331,6 +336,12 @@ pub(super) const GOAL_CONTINUATION_DIRECTIVE_TEMPLATE: &str =
     include_str!("templates/goal_continuation_directive.md");
 pub(super) const GOAL_CONTINUATION_DIRECTIVE_TEMPLATE_LEGACY: &str =
     include_str!("templates/goal_continuation_directive_legacy.md");
+/// Compact can run mid-turn (`run_compact_only` / CompactAndResubmit); those
+/// callers must not inherit TurnEnd drain, `rounds_since_verify++`, or budget stop.
+enum GoalContinuationPurpose {
+    TurnEnd,
+    Compaction,
+}
 /// Built continuation directive plus the optional premature-stop pattern that the caller emits when it actually continues.
 /// Produced by [`SessionActor::prepare_goal_continuation`].
 struct GoalContinuationPlan {
@@ -620,9 +631,10 @@ pub(crate) struct PreparedToolCall {
     tool_call_id: acp::ToolCallId,
     /// The tool name as requested by the model.
     tool_name: String,
-    /// The raw arguments string (for post_tool_use hook payload).
+    /// Authored arguments; file references never expand into conversation payloads.
     raw_arguments: String,
-    /// Parsed JSON arguments ready for bridge.call().
+    mcp_file: Option<mcp_file_input::PreparedMcpFile>,
+    /// Authored/recovered arguments; dispatch uses execution_arguments().
     parsed_args: serde_json::Value,
     /// Model ID at time of call.
     model_id: String,
@@ -714,7 +726,8 @@ impl StreamApplySpan {
     }
 }
 pub(crate) struct SessionActor {
-    pub(crate) repo_status_prefetch: crate::session::repo_status_prefix::RepoStatusPrefetchState,
+    /// Git/jj working-tree root for templated first-message prefixes, if any.
+    pub(crate) vcs_root: Option<std::path::PathBuf>,
     pub(crate) session_info: SessionInfo,
     /// Transient turn-retry kill switch, resolved once at spawn; flips apply to new sessions.
     /// Off for subagents in the first release; headless is enforced per turn via `attach_non_interactive`.
@@ -1044,8 +1057,6 @@ pub(crate) struct SessionActor {
     /// Resolved workspace root for hooks: git worktree root if in a git repo, otherwise session cwd.
     /// Used for hook child process cwd, envelope fields, and GROK_WORKSPACE_ROOT env var.
     pub(crate) hook_resolved_workspace_root: String,
-    /// The detected VCS kind for this session's workspace.
-    pub(crate) vcs_kind: xai_grok_workspace::session::git::VcsKind,
     /// Errors from last hook config load (parse failures, etc.).
     pub(crate) hook_load_errors: std::cell::RefCell<Vec<String>>,
     /// Plugin registry snapshot for this session. Updated on `/plugins reload`.
@@ -1271,8 +1282,9 @@ impl SessionActor {
         slash_commands::CommandAvailability {
             feedback: self.feedback_manager.is_enabled(),
             memory: self.memory.is_enabled() && can_read_memory,
-            memory_configured: self.memory.backend_params.is_some()
-                || self.memory.configured_storage.is_some(),
+            memory_configured: !self.memory.process_disabled
+                && (self.memory.backend_params.is_some()
+                    || self.memory.configured_storage.is_some()),
             scheduler: tool_names.iter().any(|n| {
                 n == xai_grok_tools::implementations::grok_build::SCHEDULER_CREATE_TOOL_NAME
             }),
@@ -2233,6 +2245,9 @@ mod managed_gateway_tool_tests {
         assert!(!names.contains("slack__search"));
     }
 }
+#[cfg(test)]
+#[path = "acp_session_tests/goal/goal_compaction_reseed_tests.rs"]
+mod goal_compaction_reseed_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/goal/goal_planner_e2e_tests.rs"]
 mod goal_planner_e2e_tests;

@@ -1158,7 +1158,7 @@ pub struct MarketplaceSourceEntry {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
-    /// Number of days to keep stale sessions before cleanup. Default: 30.
+    /// Unset or `0` disables cleanup; there is no default TTL.
     pub cleanup_ttl_days: Option<u32>,
 }
 pub use xai_grok_agent::prompt::paths::PathsConfig;
@@ -2320,13 +2320,17 @@ impl Config {
             self.grok_com_config.force_login_team_uuid.take(),
         );
     }
+    /// Whether product analytics may run. Every product analytics check calls this.
+    pub fn product_analytics_enabled(&self, auth: Option<&xai_grok_login::GrokAuth>) -> bool {
+        self.is_telemetry_enabled() && !auth.is_some_and(|auth| auth.is_zdr_team())
+    }
     pub(crate) fn is_telemetry_enabled(&self) -> bool {
         self.resolve_telemetry_mode().value.is_enabled()
     }
     pub fn is_trace_upload_enabled(&self) -> bool {
         self.resolve_trace_upload().value
     }
-    pub(crate) fn is_feedback_enabled(&self) -> bool {
+    pub fn is_feedback_enabled(&self) -> bool {
         self.is_feature_enabled(Feature::Feedback)
     }
     pub(crate) fn is_session_recap_enabled(&self) -> bool {
@@ -4263,6 +4267,10 @@ impl ModelInfo {
     /// | `hidden` | `supported_in_api` | OAuth user | API-key user | |----------|--------------------|------------|--------------| | true | _ | hidden | hidden | | false | true | visible | visible | | false | false | visible | **hidden** |
     pub(crate) fn visible_for_auth(&self, is_session_auth: bool) -> bool {
         !self.hidden && (is_session_auth || self.supported_in_api)
+    }
+    /// One rule for the model list, explicit task-model admission, and the task-model presentation.
+    pub(crate) fn is_picker_eligible(&self, is_session_auth: bool) -> bool {
+        self.user_selectable && self.visible_for_auth(is_session_auth)
     }
 }
 /// Flat struct so credential and endpoint fields coexist after deep-merge.

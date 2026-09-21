@@ -356,6 +356,41 @@ pub async fn emit_event_with_origin_now<T: Serialize + Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn file_failure_context_survives_blocking_measurement_on_the_caller() {
+        use crate::events::{
+            McpFileInputCompleted, McpFileInputKind, McpFileInputOutcome, TelemetryEvent,
+        };
+        let context = TelemetryCtx::new(
+            "mcp-overflow-session".to_owned(),
+            Arc::new(tokio::sync::Mutex::new(7)),
+        );
+        with_session_ctx(context, async {
+            assert!(
+                tokio::task::spawn_blocking(clone_current)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let (name, context, _, event) = take_emit_context(
+                EmitterOrigin::Shell,
+                McpFileInputCompleted::NAME,
+                McpFileInputCompleted {
+                    kind: McpFileInputKind::Arguments,
+                    outcome: McpFileInputOutcome::Failed,
+                    source_bytes: 42,
+                    snapshot_bytes: 64,
+                    duration_ms: 1,
+                },
+            );
+            assert_eq!("grok-shell-mcp_file_input_completed", name);
+            assert_eq!(Some(("mcp-overflow-session".to_owned(), Some(7))), context);
+            assert_eq!(42, event.source_bytes);
+            assert_eq!(64, event.snapshot_bytes);
+        })
+        .await;
+    }
+
     #[test]
     fn only_one_shot_flows_drain_at_session_exit() {
         use crate::process_info::Entrypoint;

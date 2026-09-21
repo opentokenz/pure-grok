@@ -354,8 +354,8 @@ pub(crate) struct SubagentSpawnContext {
     pub managed_mcp_state: crate::session::managed_mcp::ManagedMcpStateHandle,
     /// Snapshot of the parent session's MCP client pool at spawn time.
     pub parent_mcp_pool: Option<crate::session::mcp_servers::SharedMcpPool>,
-    /// Exact parent tool schema for verbatim non-workflow forks.
-    pub parent_tool_definitions: Option<Vec<xai_grok_sampling_types::ToolSpec>>,
+    /// Exact parent tool schema, paired with its selection mode, for verbatim non-workflow forks.
+    pub parent_tool_definitions: Option<crate::session::commands::ForkedToolSnapshot>,
     /// Pre-discovered skills from the parent session, captured at spawn time.
     pub parent_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
     /// Parent's skills config for the child's SkillManager.
@@ -433,14 +433,20 @@ impl SubagentSpawnContext {
         }
     }
     /// Not `Config::feature`: the parent's tiers resolve against the subagent's own remote settings snapshot.
-    pub(crate) fn resolve_feature(&self, feature: crate::agent::config::Feature) -> bool {
+    pub(crate) fn feature(
+        &self,
+        feature: crate::agent::config::Feature,
+    ) -> crate::agent::config::Resolved<bool> {
         use crate::agent::config::FeatureSources;
         let mut sources = self.agent_config.as_ref().map_or_else(
             || FeatureSources::from_process_env(feature),
             |parent| parent.feature_sources(feature),
         );
         sources.remote = feature.remote_value(self.remote_settings.as_ref());
-        feature.resolve(sources).value
+        feature.resolve(sources)
+    }
+    pub(crate) fn resolve_feature(&self, feature: crate::agent::config::Feature) -> bool {
+        self.feature(feature).value
     }
     pub(crate) fn resolve_compaction_verbatim_input(&self) -> bool {
         self.resolve_feature(crate::agent::config::Feature::CompactionVerbatimInput)
@@ -2672,5 +2678,7 @@ pub(crate) async fn reconcile_live_orphaned_subagents(
     )
     .await;
 }
+#[cfg(feature = "test-support")]
+pub(crate) mod isolated_spawn_e2e;
 #[cfg(test)]
 mod tests;

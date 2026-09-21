@@ -26,7 +26,7 @@ pub(super) async fn dispatch_tool(
     workspace_ops
         .call_tool(
             &prepared.tool_name,
-            prepared.parsed_args.clone(),
+            prepared.execution_arguments().clone(),
             &prepared.tool_call_id.0,
             Some(session_id),
         )

@@ -12,11 +12,16 @@ use super::start_artifact_publication::{
     PreparedStartArtifacts, PublicationBoundary, StartArtifactPublication,
 };
 use super::*;
+use crate::agent::remote_config::task_model_policy::{
+    TaskModelSelection, selection_telemetry_kind,
+};
 use crate::upload::trace::PromptMetadataParams;
 use xai_grok_sampling_types::ReasoningEffort;
+use xai_grok_telemetry::events::{SubagentModelOverrideRejected, SubagentModelRejectionReason};
 use xai_grok_telemetry::region;
 use xai_grok_telemetry::region::Parent;
 use xai_grok_telemetry::subagent_spawn::{SubagentSpawnPhase, phase_region};
+use xai_grok_tools::implementations::grok_build::task::model_policy;
 use xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageSource;
 use xai_grok_tools::implementations::grok_build::task::types::SubagentCapabilityModeExt;
 use xai_grok_tools::implementations::{grok_build, opencode};
@@ -301,18 +306,44 @@ impl WakePersistenceContext {
         }
     }
 }
-pub(super) fn task_model_override_error(
-    requested: Option<&str>,
-    provenance: ModelOverrideProvenance,
+/// `None` on resume: the source model stays pinned.
+pub(super) fn explicit_tool_model(
+    overrides: &SubagentRuntimeOverrides,
     is_resume: bool,
-    available: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
-    is_session_auth: bool,
-) -> Option<String> {
-    if provenance != ModelOverrideProvenance::Tool || is_resume {
+) -> Option<(String, TaskModelSelection)> {
+    let ModelOverrideProvenance::Tool { selection } = overrides.model_override_provenance else {
+        return None;
+    };
+    if is_resume {
         return None;
     }
-    let requested = requested?;
-    crate::agent::remote_config::task_model_error_for_catalog(requested, available, is_session_auth)
+    overrides.model.clone().map(|model| (model, selection))
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TaskModelAdmissionError {
+    HiddenSelection,
+    Unavailable(String),
+}
+/// The originating mode is enforced before availability, whatever the catalog says now.
+pub(super) fn admit_explicit_tool_model(
+    requested: &str,
+    selection: TaskModelSelection,
+    available: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
+    is_session_auth: bool,
+) -> Result<(), TaskModelAdmissionError> {
+    match selection {
+        TaskModelSelection::Inherited => Err(TaskModelAdmissionError::HiddenSelection),
+        TaskModelSelection::Selectable => {
+            crate::agent::remote_config::task_model_error_for_catalog(
+                requested,
+                available,
+                is_session_auth,
+            )
+            .map_or(Ok(()), |message| {
+                Err(TaskModelAdmissionError::Unavailable(message))
+            })
+        }
+    }
 }
 #[tracing::instrument(
     name = "subagent.handle_request",
@@ -530,16 +561,29 @@ pub(crate) async fn run_shell_child(
             );
         }
     }
-    if let Some(error) = task_model_override_error(
-        request.runtime_overrides.model.as_deref(),
-        request.runtime_overrides.model_override_provenance,
-        resume_source.is_some(),
-        &ctx.available_models,
-        ctx.auth_manager
-            .current_or_expired()
-            .is_some_and(|a| a.is_session_auth()),
-    ) {
-        return child_run_output(failure_result(&request, &error), completion_data, None);
+    if let Some((requested, selection)) =
+        explicit_tool_model(&request.runtime_overrides, resume_source.is_some())
+        && let Err(error) = admit_explicit_tool_model(
+            &requested,
+            selection,
+            &ctx.available_models,
+            ctx.auth_manager
+                .current_or_expired()
+                .is_some_and(|a| a.is_session_auth()),
+        )
+    {
+        let message = match error {
+            TaskModelAdmissionError::HiddenSelection => {
+                xai_grok_telemetry::session_ctx::log_event(SubagentModelOverrideRejected {
+                    parent_session_id: request.parent_session_id.clone(),
+                    owner: telemetry_owner_kind(&request),
+                    reason: SubagentModelRejectionReason::HiddenSelection,
+                });
+                model_policy::hidden_selection_message(model_policy::MODEL_PARAM)
+            }
+            TaskModelAdmissionError::Unavailable(message) => message,
+        };
+        return child_run_output(failure_result(&request, &message), completion_data, None);
     }
     let worktree_path = if let Some(ref source) = resume_source {
         if effective_runtime.isolation != xai_tool_types::SubagentIsolationMode::None
@@ -615,6 +659,8 @@ pub(crate) async fn run_shell_child(
         let subagent_id = request.id.clone();
         let creation_mode: xai_fast_worktree::CreationMode = ctx.worktree_type.into();
         let btrfs_delegate = crate::session::worktree::btrfs_delegate_from_env();
+        let (grove_enabled, grove_gate_source) =
+            crate::util::config::grove_worktree_gate(ctx.remote_settings.as_ref());
         let worktree_create_span = region!(
             "subagent_spawn.worktree_create",
             Parent::Explicit(spawn_prepare_span.span())
@@ -627,6 +673,11 @@ pub(crate) async fn run_shell_child(
                     .creation_mode(creation_mode)
                     .worktree_kind(xai_fast_worktree::WorktreeKind::Subagent)
                     .session_id(subagent_id);
+                if let Some(opts) =
+                    crate::util::config::grove_worktree_opts_if_enabled(grove_enabled)
+                {
+                    builder = builder.grove_worktree(opts);
+                }
                 if let Some(delegate) = btrfs_delegate {
                     builder = builder.btrfs_delegate(delegate);
                 }
@@ -642,6 +693,8 @@ pub(crate) async fn run_shell_child(
                     commit = %report.commit,
                     resolved_strategy = report.resolved_strategy,
                     skipped = %xai_fast_worktree::render_arm_skips(&report.skipped),
+                    grove_worktree = grove_enabled,
+                    grove_gate_source,
                     "Created isolated worktree for subagent"
                 );
                 Some(report.worktree_path)
@@ -650,7 +703,11 @@ pub(crate) async fn run_shell_child(
                 tracing::warn!(
                     subagent_id = %request.id,
                     error = %e,
-                    "Failed to create worktree, falling back to shared workspace"
+                    resolved_strategy = "none",
+                    skipped = "",
+                    grove_worktree = grove_enabled,
+                    grove_gate_source,
+                    "Failed to create worktree (grove gate {grove_gate_source}), falling back to shared workspace"
                 );
                 None
             }
@@ -658,7 +715,11 @@ pub(crate) async fn run_shell_child(
                 tracing::warn!(
                     subagent_id = %request.id,
                     error = %e,
-                    "Worktree creation task panicked, falling back to shared workspace"
+                    resolved_strategy = "none",
+                    skipped = "",
+                    grove_worktree = grove_enabled,
+                    grove_gate_source,
+                    "Worktree creation task panicked (grove gate {grove_gate_source}), falling back to shared workspace"
                 );
                 None
             }
@@ -1439,6 +1500,12 @@ pub(crate) async fn run_shell_child(
         parent_session_id: request.parent_session_id.clone(),
         subagent_type: request.subagent_type.clone(),
         owner: telemetry_owner_kind(&request),
+        model_selection: match request.runtime_overrides.model_override_provenance {
+            ModelOverrideProvenance::Tool { selection } => {
+                Some(selection_telemetry_kind(selection))
+            }
+            ModelOverrideProvenance::Harness => None,
+        },
         workflow_run_id: request.owner.workflow_run_id().map(str::to_string),
         queued_ms: queued_for.map(|queued| u64::try_from(queued.as_millis()).unwrap_or(u64::MAX)),
         session_running: u32::try_from(session_running).unwrap_or(u32::MAX),
@@ -1460,7 +1527,7 @@ pub(crate) async fn run_shell_child(
             .tx
             .send(crate::session::persistence::PersistenceMsg::CurrentModel {
                 model_id: effective_model_id.clone(),
-                agent_name: Some(definition.name.clone()),
+                agent: crate::session::persistence::PersistedAgent::from(&definition),
                 reasoning_effort: Some(effective_sampling_config.reasoning_effort),
             });
     }
@@ -1627,6 +1694,7 @@ pub(crate) async fn run_shell_child(
         } else {
             None
         },
+        ctx.feature(crate::agent::config::Feature::SubagentModelInheritance),
         false,
         Some(xai_grok_telemetry::subagent_spawn::SpawnPhaseContext {
             timer: spawn_timer.clone(),
